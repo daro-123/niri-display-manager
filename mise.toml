@@ -1,0 +1,29 @@
+[tasks.test]
+description = "Run layout tests and check Python syntax"
+dir = "{{config_root}}"
+run = """
+set -eu
+python3 -m unittest discover -s tests -v
+python3 -m py_compile app.py backend.py services.py
+"""
+
+[tasks.install]
+description = "Install Niri Displays for the current user"
+dir = "{{config_root}}"
+run = '''
+set -eu
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/niri-display"
+bin_dir="$HOME/.local/bin"
+launcher="$bin_dir/niri-display"
+if [ -e "$launcher" ] || [ -L "$launcher" ]; then
+    if [ ! -L "$launcher" ] || [ "$(readlink "$launcher")" != "$data_dir/app.py" ]; then
+        printf 'Refusing to replace existing launcher: %s\n' "$launcher" >&2
+        exit 1
+    fi
+fi
+install -d "$data_dir" "$bin_dir"
+install -m 755 app.py "$data_dir/app.py"
+install -m 644 backend.py services.py "$data_dir/"
+ln -sfn "$data_dir/app.py" "$launcher"
+printf 'Installed %s\nAdd %s to PATH, then run niri-display.\n' "$launcher" "$bin_dir"
+'''
