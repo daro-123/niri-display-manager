@@ -13,6 +13,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk
 
 from backend import NiriClient, snapshot
 from services import ConfigStore, MirrorManager
+from daemon import LayoutMemory, enabled as daemon_enabled, set_enabled as set_daemon_enabled
 
 
 class DisplayWindow(Gtk.ApplicationWindow):
@@ -22,6 +23,8 @@ class DisplayWindow(Gtk.ApplicationWindow):
         self.client = client or NiriClient()
         self.store = store or ConfigStore()
         self.mirrors = mirrors or MirrorManager()
+        self.memory = LayoutMemory()
+        self.updating_daemon = False
         self.outputs = {}
         self.layout = []
         self.baseline = None
@@ -122,6 +125,18 @@ class DisplayWindow(Gtk.ApplicationWindow):
             "When disabled, choose a source for the selected destination.")
         self.mirror_orientation.connect("toggled", self.change_mirror_orientation)
         settings_box.append(self.mirror_orientation)
+        settings_box.append(Gtk.Label(label="Saved layouts", xalign=0, css_classes=["heading"]))
+        self.daemon_toggle = Gtk.CheckButton(label="Restore layouts automatically")
+        self.daemon_toggle.set_tooltip_text(
+            "Run a background user service, including after closing this window. "
+            "Restore confirmed layouts at login and when connected monitors change. "
+            "Requires a systemd user session.")
+        try:
+            self.daemon_toggle.set_active(daemon_enabled())
+        except RuntimeError:
+            self.daemon_toggle.set_sensitive(False)
+        self.daemon_toggle.connect("toggled", self.change_daemon)
+        settings_box.append(self.daemon_toggle)
         settings_popover.set_child(settings_box)
         self.toolbar.append(settings)
         self.summary = Gtk.Label(xalign=0)
@@ -267,6 +282,35 @@ class DisplayWindow(Gtk.ApplicationWindow):
                 focused.activate()
                 return True
         return False
+
+    def change_daemon(self, widget):
+        if self.updating_daemon:
+            return
+        active = widget.get_active()
+        baseline = copy.deepcopy(self.baseline)
+
+        def change():
+            try:
+                if active and baseline and self.memory.recall(row["name"] for row in baseline) is None:
+                    self.memory.remember(baseline)
+                set_daemon_enabled(active)
+                return active, None
+            except Exception as error:
+                try:
+                    actual = daemon_enabled()
+                except RuntimeError:
+                    actual = False
+                return actual, str(error)
+
+        def changed(result):
+            actual, error = result
+            self.updating_daemon = True
+            self.daemon_toggle.set_active(actual)
+            self.updating_daemon = False
+            self.message(error or ("Automatic layout restore enabled." if actual
+                                   else "Automatic layout restore disabled."))
+
+        self.run(change, changed)
 
     def message(self, text):
         self.status.set_text(str(text))
@@ -727,7 +771,13 @@ class DisplayWindow(Gtk.ApplicationWindow):
         self.confirm.set_visible(False)
         self.get_child().remove_css_class("confirmation-pending")
         self.editor.set_sensitive(True)
-        self.refresh()
+        layout = copy.deepcopy(self.layout)
+
+        def remember():
+            self.memory.remember(layout)
+            return self.client.outputs()
+
+        self.run(remember, self.received)
 
     def revert(self):
         if self.busy or self.previous is None:
