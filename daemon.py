@@ -22,6 +22,27 @@ def config_home() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 
 
+def _refresh_niri_socket() -> bool:
+    """Recover a stale service environment without choosing between sessions."""
+    address = os.environ.get("NIRI_SOCKET")
+    if address and Path(address).is_socket():
+        return False
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        return False
+    display = os.environ.get("WAYLAND_DISPLAY")
+    prefix = f"niri.{display}." if display else "niri."
+    candidates = [
+        path for path in Path(runtime).glob("niri.*.sock")
+        if path.name.startswith(prefix) and path.is_socket()
+    ]
+    if len(candidates) != 1:
+        return False
+    os.environ["NIRI_SOCKET"] = str(candidates[0])
+    logging.info("Connected to current Niri socket %s", candidates[0])
+    return True
+
+
 class LayoutMemory:
     """Keep one confirmed layout for each exact set of output connector names."""
 
@@ -151,6 +172,8 @@ def main() -> int:
         daemon = RestoreDaemon()
         while True:
             try:
+                if _refresh_niri_socket():
+                    daemon.connected = None
                 daemon.poll()
             except (RuntimeError, ValueError) as error:
                 logging.error("%s", error)
