@@ -22,7 +22,7 @@ On Fedora, the Python/GTK dependencies are available as:
 sudo dnf install python3-gobject gtk4 python3-cairo
 ```
 
-Niri and wl-mirror can come from your existing system packages or Nix profile. Use the system Python that provides `gi`; a plain virtual environment will not normally include system PyGObject.
+Niri and wl-mirror can come from your existing system packages or Nix profile. On non-NixOS systems, install `nixGL` if `wl-mirror` comes from Nix; the app automatically launches that Nix-store binary through `nixGL` when available. Use the system Python that provides `gi`; a plain virtual environment will not normally include system PyGObject.
 
 ## Optional background daemon
 

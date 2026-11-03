@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 from typing import Any, BinaryIO
@@ -169,8 +170,17 @@ class MirrorManager:
         except OSError as exc:
             raise RuntimeError(f"Cannot capture wl-mirror errors: {exc}") from exc
         try:
+            command = ["wl-mirror", "--fullscreen-output", target, source]
+            binary = shutil.which("wl-mirror")
+            nix_gl = shutil.which("nixGL")
+            if (
+                binary
+                and nix_gl
+                and Path(binary).resolve().is_relative_to(Path("/nix/store"))
+            ):
+                command.insert(0, nix_gl)
             process = subprocess.Popen(
-                ["wl-mirror", "--fullscreen-output", target, source],
+                command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_file,
