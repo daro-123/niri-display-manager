@@ -1,4 +1,4 @@
-"""Opt-in systemd user service for restoring confirmed monitor layouts."""
+"""Opt-in systemd user service for remembering and restoring monitor layouts."""
 from __future__ import annotations
 
 import argparse
@@ -44,7 +44,7 @@ def _refresh_niri_socket() -> bool:
 
 
 class LayoutMemory:
-    """Keep one confirmed layout for each exact set of output connector names."""
+    """Keep one layout for each exact set of output connector names."""
 
     def __init__(self, directory: Path | None = None):
         self.directory = directory if directory is not None else config_home() / "niri-display" / "layouts"
@@ -75,15 +75,24 @@ class RestoreDaemon:
         self.client = client if client is not None else NiriClient()
         self.memory = memory if memory is not None else LayoutMemory()
         self.connected: frozenset[str] | None = None
+        self.observed: list[dict] | None = None
+        self.restore_failed = False
 
     def poll(self) -> None:
         outputs = self.client.outputs()
         names = frozenset(outputs)
-        if names == self.connected:
-            return
-        self.connected = names
-        desired = self.memory.recall(names)
         previous = snapshot(outputs)
+        if names == self.connected:
+            if not self.restore_failed and any(row["enabled"] for row in previous):
+                self.observed = previous
+            return
+        # Use the last complete snapshot, not Niri's post-disconnect layout.
+        if self.connected is not None and self.observed is not None:
+            self.memory.remember(self.observed)
+        self.connected = names
+        self.observed = None
+        self.restore_failed = False
+        desired = self.memory.recall(names)
         if desired is None:
             if (
                 len(previous) == 1
@@ -94,9 +103,13 @@ class RestoreDaemon:
                 previous[0]["enabled"] = True
                 self.client.apply(previous)
                 logging.info("Enabled sole built-in display %s", previous[0]["name"])
+            if any(row["enabled"] for row in previous):
+                self.observed = previous
             return
         if sorted(previous, key=lambda row: row["name"]) == sorted(desired, key=lambda row: row["name"]):
+            self.observed = previous
             return
+        self.restore_failed = True
         try:
             self.client.apply(desired)
         except Exception as error:
@@ -105,6 +118,8 @@ class RestoreDaemon:
             except Exception as rollback_error:
                 raise RuntimeError(f"Restore failed: {error}. Rollback failed: {rollback_error}") from error
             raise RuntimeError(f"Restore failed; previous layout restored: {error}") from error
+        self.restore_failed = False
+        self.observed = desired
         logging.info("Restored layout for %s", ", ".join(sorted(names)))
 
 

@@ -54,15 +54,11 @@ class DisplayWindow(Gtk.ApplicationWindow):
 
     def dropdown(self, labels, title=lambda value: value):
         dropdown = Gtk.DropDown(model=Gtk.StringList.new(labels))
-        for selected in (True, False):
-            factory = Gtk.SignalListItemFactory()
-            factory.connect("setup", lambda _, row: row.set_child(Gtk.Label(xalign=0)))
-            factory.connect("bind", lambda _, row, arrow=selected: row.get_child().set_text(
-                title(row.get_item().get_string()) + ("   ▾" if arrow else "")))
-            if selected:
-                dropdown.set_factory(factory)
-            else:
-                dropdown.set_list_factory(factory)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", lambda _, row: row.set_child(Gtk.Label(xalign=0)))
+        factory.connect("bind", lambda _, row: row.get_child().set_text(
+            title(row.get_item().get_string())))
+        dropdown.set_factory(factory)
         return dropdown
 
     def build(self):
@@ -82,13 +78,6 @@ class DisplayWindow(Gtk.ApplicationWindow):
             .confirmation-actions button { padding: 10px 20px; }
             .confirmation-progress trough,
             .confirmation-progress progress { min-height: 4px; }
-            dropdown > button > box > arrow,
-            menubutton > button > box > arrow {
-                -gtk-icon-source: none;
-                min-width: 0;
-                min-height: 0;
-                margin: 0;
-            }
         """)
         Gtk.StyleContext.add_provider_for_display(
             self.get_display(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -129,7 +118,7 @@ class DisplayWindow(Gtk.ApplicationWindow):
         self.daemon_toggle = Gtk.CheckButton(label="Restore layouts automatically")
         self.daemon_toggle.set_tooltip_text(
             "Run a background user service, including after closing this window. "
-            "Restore confirmed layouts at login and when connected monitors change. "
+            "Remember layouts on disconnect and restore them at login and reconnect. "
             "Requires a systemd user session.")
         try:
             self.daemon_toggle.set_active(daemon_enabled())
@@ -194,7 +183,7 @@ class DisplayWindow(Gtk.ApplicationWindow):
         self.dock.add_css_class("display-dock")
         dock_scroll.set_child(self.dock)
 
-        self.mirror_menu = Gtk.MenuButton(label="Independent   ▾")
+        self.mirror_menu = Gtk.MenuButton(label="Independent")
         self.mirror_popover = Gtk.Popover()
         self.mirror_menu.set_popover(self.mirror_popover)
         mirror = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -949,7 +938,7 @@ class DisplayWindow(Gtk.ApplicationWindow):
         self.mirror_peer.set_tooltip_text(
             f"Choose a {peer_role} display; selected display is the {role.lower()}")
         self.mirror_menu.set_label(
-            ("Mirroring" if running and self.selected_monitor in self.mirror_pair else "Independent") + "   ▾")
+            "Mirroring" if running and self.selected_monitor in self.mirror_pair else "Independent")
         if running:
             source, target = self.mirror_pair
             self.mirror_status.set_text(f"Active · {source} → {target}. Stop this mirror before starting another.")
