@@ -418,7 +418,9 @@ class DisplayWindow(Gtk.ApplicationWindow):
     def rebuild(self):
         names = [item["name"] for item in self.layout]
         if self.selected_monitor not in names:
-            self.selected_monitor = names[0] if names else None
+            self.selected_monitor = next(
+                (item["name"] for item in self.layout if item["enabled"]),
+                names[0] if names else None)
         self.mirror_popover.popdown()
         if self.mirror_menu.get_parent():
             self.mirror_menu.get_parent().remove(self.mirror_menu)
