@@ -34,7 +34,7 @@ The daemon restores the last confirmed layout for an exact set of output connect
 
 If disconnecting external monitors leaves only a disabled built-in display, the daemon turns it on even without a saved layout. Built-in displays are identified by `eDP-`, `LVDS-`, or `DSI-` connector names. This fallback does not enable a lone external display or change an already enabled built-in display.
 
-Enabling creates and starts `niri-display-daemon.service` in your systemd user session. The service keeps running after the app closes. Automatic startup at login requires Niri to manage `graphical-session.target`, such as a session started with `niri --session`. Without that session integration, enabling still starts the daemon now, but login startup is not guaranteed. Re-run the install task before enabling if you run an installed copy.
+Enabling creates and starts `niri-display-daemon.service` in your systemd user session. The service starts with the user manager's `default.target`, so login startup does not require `niri --session` or `graphical-session.target`. It keeps running after the app closes and waits for Niri to become available. If user lingering is enabled, it may also run outside a graphical session. Re-run the install task after updating an installed copy, then enable the option again (or run `python3 daemon.py --enable`) to migrate an existing service's startup links.
 
 The daemon can also be controlled from the source directory:
 

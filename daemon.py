@@ -155,10 +155,9 @@ def set_enabled(active: bool) -> None:
     unit.parent.mkdir(parents=True, exist_ok=True)
     command = " ".join(_unit_argument(value) for value in (sys.executable, str(Path(__file__).resolve())))
     unit.write_text(
-        "[Unit]\nDescription=Restore saved Niri display layouts\n"
-        "PartOf=graphical-session.target\nAfter=graphical-session.target\n\n"
+        "[Unit]\nDescription=Restore saved Niri display layouts\n\n"
         "[Service]\nType=simple\nExecStart=" + command + "\n\n"
-        "[Install]\nWantedBy=graphical-session.target\n",
+        "[Install]\nWantedBy=default.target\n",
         encoding="utf-8",
     )
     _checked("daemon-reload")
@@ -166,7 +165,8 @@ def set_enabled(active: bool) -> None:
     variables = [name for name in ("NIRI_SOCKET", "WAYLAND_DISPLAY", "DISPLAY") if name in os.environ]
     if variables:
         _checked("import-environment", *variables)
-    _checked("enable", "--now", SERVICE)
+    _checked("reenable", SERVICE)
+    _checked("start", SERVICE)
 
 
 def main() -> int:
