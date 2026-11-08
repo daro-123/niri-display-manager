@@ -29,22 +29,28 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
         self.closing = False
         self.previous = None
         self.profiles = []
+        self.drop_position = None
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
                        margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
         self.set_child(root)
         self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.drop_line = Gtk.DrawingArea(can_target=False)
+        self.drop_line.set_draw_func(self.draw_drop_indicator)
         self.list.set_activate_on_single_click(True)
         self.list.connect("row-activated", self.row_activated)
         scroller = Gtk.ScrolledWindow(
             propagate_natural_height=True, max_content_height=420,
             hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroller.set_child(self.list)
+        overlay = Gtk.Overlay()
+        overlay.set_child(self.list)
+        overlay.add_overlay(self.drop_line)
+        scroller.set_child(overlay)
         root.append(scroller)
         root.append(Gtk.Label(
             label="1–9 Switch · E Editor · ⠿ Reorder",
             xalign=0, wrap=False, css_classes=["dim-label"],
-            tooltip_text="Drag a profile's ⠿ handle to reorder."))
+            tooltip_text="Drag a profile row to reorder."))
         self.status = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
         self.status.set_visible(False)
         self.status.connect("notify::label", lambda label, *_: label.set_visible(bool(label.get_text())))
@@ -104,10 +110,12 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
         self.run(self.store.list_names, loaded)
 
     def build_rows(self, selected=None):
+        self.clear_drop_indicator()
         while self.list.get_first_child() is not None:
             self.list.remove(self.list.get_first_child())
         for index, name in enumerate(self.profiles):
             row = Gtk.ListBoxRow()
+            row.set_cursor_from_name("grab")
             row.profile_name = name
             box = Gtk.Box(spacing=10, margin_top=8, margin_bottom=8,
                           margin_start=10, margin_end=10)
@@ -122,8 +130,12 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
             source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
             source.connect("prepare", lambda _source, _x, _y, value=name:
                            Gdk.ContentProvider.new_for_value(value))
-            handle.add_controller(source)
+            source.connect("drag-end", lambda *_: self.clear_drop_indicator())
+            row.add_controller(source)
             target = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
+            target.connect("enter", self.show_drop_indicator, row)
+            target.connect("motion", self.show_drop_indicator, row)
+            target.connect("leave", lambda *_: self.clear_drop_indicator())
             target.connect("drop", self.drop_profile, row)
             row.add_controller(target)
             self.list.append(row)
@@ -131,7 +143,36 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
                 self.list.select_row(row)
                 row.grab_focus()
 
+    def clear_drop_indicator(self):
+        self.drop_position = None
+        self.drop_line.queue_draw()
+
+    def draw_drop_indicator(self, _area, cr, width, height):
+        if self.drop_position is None:
+            return
+        found, color = self.list.get_style_context().lookup_color("theme_fg_color")
+        if not found:
+            color = self.list.get_color()
+        cr.set_source_rgba(color.red, color.green, color.blue, color.alpha)
+        cr.set_line_width(2)
+        y = max(1, min(self.drop_position, height - 1))
+        cr.move_to(0, y)
+        cr.line_to(width, y)
+        cr.stroke()
+
+    def show_drop_indicator(self, _target, _x, y, row):
+        self.clear_drop_indicator()
+        if self.busy or self.previous is not None:
+            return Gdk.DragAction(0)
+        allocation = row.get_allocation()
+        self.drop_position = allocation.y
+        if y >= row.get_height() / 2:
+            self.drop_position += allocation.height
+        self.drop_line.queue_draw()
+        return Gdk.DragAction.MOVE
+
     def drop_profile(self, _target, name, _x, y, row):
+        self.clear_drop_indicator()
         if self.busy or self.previous is not None or name not in self.profiles:
             return False
         target_name = row.profile_name

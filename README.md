@@ -40,7 +40,7 @@ niri-display --profiles
 
 Press **1–9** to apply the corresponding numbered profile immediately and close the picker. Number-pad digits also work. Alternatively, use the arrow keys and Enter, or click a profile. This mode does not ask for confirmation or automatically revert successful changes; the full editor still does. Escape closes the picker without switching. If a switch is already running, it finishes before the picker closes. Failed applies attempt to restore the previous layout.
 
-Drag a profile's **⠿** handle onto the upper or lower half of another row to place it before or after that profile. The order is saved across launches and also used in the editor's profile list. Shortcuts always follow the current order; profiles after the ninth remain accessible by clicking or using the arrow keys. Newly created profiles appear after the saved order.
+Drag anywhere on a profile row onto the upper or lower half of another row to place it before or after that profile. The whole row shows a grab cursor on hover. During dragging, one shared line marks the insertion boundary between rows: hovering the lower half of one row or the upper half of the next shows the same line. The line disappears when the drag leaves or ends. The order is saved across launches and also used in the editor's profile list. Shortcuts always follow the current order; profiles after the ninth remain accessible by clicking or using the arrow keys. Newly created profiles appear after the saved order.
 
 The picker fits its height to the list, scrolling when the list exceeds 420 pixels.
 
