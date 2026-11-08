@@ -68,7 +68,7 @@ class LayoutSafetyTests(unittest.TestCase):
 
 class CanvasGeometryTests(unittest.TestCase):
     def test_fractional_output_edges_include_partial_logical_pixels(self):
-        from app import DisplayWindow
+        from editor import DisplayWindow
 
         for transform, expected in (
             ("normal", (1552, 873)),

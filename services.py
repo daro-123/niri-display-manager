@@ -9,13 +9,9 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
-import tempfile
 import unicodedata
 from typing import Any, BinaryIO
-
-from backend import snapshot
 
 
 _MODE_PATTERN = re.compile(r"([0-9]+)x([0-9]+)@([0-9]+(?:\.[0-9]+)?)\Z")
@@ -106,6 +102,8 @@ class ConfigStore:
     """Read and write validated monitor configuration JSON at chosen paths."""
 
     def save(self, path: Path, layout: list[dict]) -> None:
+        import tempfile
+
         path = Path(path)
         _validate_layout(layout, config=str(path))
         try:
@@ -207,6 +205,8 @@ class ProfileStore:
 
     def save_order(self, names: list[str]) -> None:
         """Persist the displayed order without changing any profile layouts."""
+        import tempfile
+
         if len(names) != len(set(names)) or set(names) != set(self.list_names()):
             raise ValueError("Profiles changed. Reopen the picker before reordering.")
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -228,6 +228,8 @@ class ProfileStore:
                 os.unlink(temporary)
 
     def save(self, name: str, layout: list[dict]) -> None:
+        import tempfile
+
         filename = self._filename(name)
         path = self.directory / filename
         _validate_layout(layout, config=f"profile '{name}'")
@@ -270,6 +272,8 @@ class ProfileStore:
 
 def merge_profile(layout: list[dict], outputs: dict[str, Any]) -> list[dict]:
     """Merge saved profile rows into current outputs without dropping connected displays."""
+    from backend import snapshot
+
     _validate_layout(layout, config="profile")
     saved_names = {output["name"] for output in layout}
     missing = sorted(saved_names - outputs.keys())
@@ -292,6 +296,9 @@ class MirrorManager:
         self._pending_error: str | None = None
 
     def start(self, source: str, target: str) -> None:
+        import shutil
+        import tempfile
+
         if not isinstance(source, str) or not source.strip():
             raise ValueError("Mirror source output must not be empty.")
         if not isinstance(target, str) or not target.strip():

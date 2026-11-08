@@ -44,6 +44,10 @@ Drag anywhere on a profile row onto the upper or lower half of another row to pl
 
 The picker fits its height to the list, scrolling when the list exceeds 420 pixels.
 
+The picker defaults to Cairo rendering to avoid GPU initialization overhead for this small, short-lived window. An explicit `GSK_RENDERER` setting takes precedence. Opening the full editor preserves the original environment, so the picker default does not change the editor's renderer.
+
+The launcher imports only the selected interface. The full editor lives in `editor.py`; the picker defers compositor and layout-memory imports until a profile is applied, and persistence helpers load write-only dependencies when needed. GTK initializes through the application instead of during picker imports. No background picker process is required.
+
 Press **E** in the picker to open the full display editor and close the picker.
 
 Profiles live under `$XDG_CONFIG_HOME/niri-display/profiles` (default `~/.config/niri-display/profiles`), separately from automatic daemon layouts. They store connector names, enabled state, mode, scale, position, and rotation, not mirroring. All monitors saved in a profile must be connected before applying it. Additional connected monitors keep their current settings.
@@ -109,7 +113,7 @@ Run the regression suite and syntax checks:
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m py_compile app.py backend.py services.py daemon.py switcher.py
+python3 -m py_compile app.py editor.py backend.py services.py daemon.py switcher.py
 ```
 
 The 15 unit tests cover layout safety, configuration boundaries, and fractional-scale canvas geometry, including rotated outputs. The geometry check requires the application's GTK dependencies but does not open a window.

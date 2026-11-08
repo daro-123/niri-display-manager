@@ -1,20 +1,20 @@
 """Compact GTK profile switcher for Niri display layouts."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
 
 import gi
+gi.disable_legacy_autoinit()
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
-from backend import NiriClient, snapshot
-from daemon import LayoutMemory
-from services import ProfileStore, merge_profile
+from services import ProfileStore
 
 
 class ProfileSwitcherWindow(Gtk.ApplicationWindow):
@@ -22,9 +22,9 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
         super().__init__(application=application, title="Display profiles")
         self.set_default_size(380, -1)
         self.set_resizable(False)
-        self.client = client or NiriClient()
+        self.client = client
         self.store = store or ProfileStore()
-        self.memory = memory or LayoutMemory()
+        self.memory = memory
         self.busy = False
         self.closing = False
         self.previous = None
@@ -90,9 +90,9 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
             try:
                 result = action()
             except Exception as error:
-                GLib.idle_add(finish, None, error)
+                GLib.idle_add(finish, None, error, priority=GLib.PRIORITY_DEFAULT)
             else:
-                GLib.idle_add(finish, result, None)
+                GLib.idle_add(finish, result, None, priority=GLib.PRIORITY_DEFAULT)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -230,6 +230,7 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
             subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve().with_name("app.py"))],
                 start_new_session=True,
+                env=self.get_application().editor_environment,
             )
         except OSError as error:
             self.status.set_text(f"Cannot open editor: {error}")
@@ -246,6 +247,11 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
         self.status.set_text(f"Applying {name}…")
 
         def action():
+            from backend import NiriClient, snapshot
+            from services import merge_profile
+
+            if self.client is None:
+                self.client = NiriClient()
             outputs = self.client.outputs()
             previous = snapshot(outputs)
             desired = merge_profile(self.store.load(name), outputs)
@@ -258,6 +264,9 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
                     return previous, f"Apply failed: {error}. Restore failed: {rollback_error}"
                 return None, f"Apply failed; previous layout restored: {error}"
             try:
+                if self.memory is None:
+                    from daemon import LayoutMemory
+                    self.memory = LayoutMemory()
                 self.memory.remember(desired)
             except Exception as error:
                 return None, f"Profile applied, but automatic restore could not remember it: {error}"
@@ -307,6 +316,9 @@ class ProfileSwitcherWindow(Gtk.ApplicationWindow):
 
 class ProfileSwitcherApplication(Gtk.Application):
     def __init__(self):
+        self.editor_environment = os.environ.copy()
+        # This small, short-lived window does not benefit from GPU initialization.
+        os.environ.setdefault("GSK_RENDERER", "cairo")
         super().__init__(application_id="io.github.niri_display.profiles",
                          flags=Gio.ApplicationFlags.NON_UNIQUE)
 
