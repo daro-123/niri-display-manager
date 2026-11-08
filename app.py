@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """GTK 4 display controls for the Niri compositor."""
+import argparse
 import copy
 import math
 import threading
@@ -12,7 +13,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk
 
 from backend import NiriClient, snapshot
-from services import ConfigStore, MirrorManager
+from services import ConfigStore, MirrorManager, ProfileStore, merge_profile
 from daemon import LayoutMemory, enabled as daemon_enabled, set_enabled as set_daemon_enabled
 
 
@@ -24,6 +25,7 @@ class DisplayWindow(Gtk.ApplicationWindow):
         self.store = store or ConfigStore()
         self.mirrors = mirrors or MirrorManager()
         self.memory = LayoutMemory()
+        self.profiles = ProfileStore()
         self.updating_daemon = False
         self.outputs = {}
         self.layout = []
@@ -94,6 +96,34 @@ class DisplayWindow(Gtk.ApplicationWindow):
         self.toolbar.append(heading)
         self.identify_button = self.button("Identify", lambda *_: self.identify())
         self.toolbar.append(self.identify_button)
+        self.profile_menu = Gtk.MenuButton(label="Profiles", valign=Gtk.Align.CENTER)
+        self.profile_popover = Gtk.Popover()
+        self.profile_menu.set_popover(self.profile_popover)
+        profile_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10,
+            margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
+        self.profile_popover.set_child(profile_box)
+        profile_box.append(Gtk.Label(label="Saved profiles", xalign=0, css_classes=["heading"]))
+        self.profile_choice = self.dropdown([])
+        profile_box.append(self.profile_choice)
+        profile_actions = Gtk.Box(spacing=8)
+        profile_box.append(profile_actions)
+        self.profile_apply = self.button("Apply profile", lambda *_: self.apply_profile())
+        self.profile_delete = self.button("Delete", lambda *_: self.delete_profile())
+        profile_actions.append(self.profile_apply)
+        profile_actions.append(self.profile_delete)
+        profile_box.append(Gtk.Separator())
+        self.profile_name = Gtk.Entry(placeholder_text="New profile name", activates_default=False)
+        self.profile_name.connect("activate", lambda *_: self.save_profile())
+        profile_box.append(self.profile_name)
+        profile_box.append(self.button("Save current edits", lambda *_: self.save_profile()))
+        profile_box.append(Gtk.Label(
+            label="Saves display settings, including unapplied edits. Mirroring is not saved.",
+            xalign=0, wrap=True, max_width_chars=36, css_classes=["dim-label"]))
+        self.profile_status = Gtk.Label(xalign=0, wrap=True, max_width_chars=36)
+        profile_box.append(self.profile_status)
+        self.profile_popover.connect("show", lambda *_: self.reload_profiles())
+        self.toolbar.append(self.profile_menu)
         for label, callback in (("Import", self.import_config), ("Export", self.export_config)):
             button = self.button(label, lambda *_, action=callback: action())
             button.add_css_class("flat")
@@ -817,6 +847,90 @@ class DisplayWindow(Gtk.ApplicationWindow):
         if self.status.get_text() in ("All changes applied.", "Unapplied changes"):
             self.message("Unapplied changes" if changed else "All changes applied.")
 
+    def reload_profiles(self, selected_name=None):
+        previous = self.profile_choice.get_selected_item()
+        selected_name = selected_name or (previous.get_string() if previous else None)
+        try:
+            names = self.profiles.list_names()
+        except Exception as error:
+            self.profile_status.set_text(str(error))
+            names = []
+        else:
+            self.profile_status.set_text("" if names else "No saved profiles yet.")
+        self.profile_choice.set_model(Gtk.StringList.new(names))
+        if selected_name in names:
+            self.profile_choice.set_selected(names.index(selected_name))
+        for widget in (self.profile_choice, self.profile_apply, self.profile_delete):
+            widget.set_sensitive(bool(names))
+
+    def save_profile(self):
+        if self.busy or self.previous is not None:
+            return
+        try:
+            name = self.profile_name.get_text().strip()
+            self.profiles.save(name, copy.deepcopy(self.layout))
+        except Exception as error:
+            self.profile_status.set_text(str(error))
+            return
+        self.profile_name.set_text("")
+        self.reload_profiles(name)
+        self.profile_status.set_text(f"Saved profile “{name}”.")
+        self.message(f"Saved profile “{name}”.")
+
+    def apply_profile(self):
+        if self.busy or self.previous is not None:
+            return
+        try:
+            name = self.selected(self.profile_choice)
+        except ValueError as error:
+            self.profile_status.set_text(str(error))
+            return
+        self.profile_popover.popdown()
+
+        def load():
+            layout = self.profiles.load(name)
+            outputs = self.client.outputs()
+            return outputs, merge_profile(layout, outputs)
+
+        def loaded(result):
+            self.outputs, self.layout = result
+            self.rebuild()
+            self.apply()
+
+        self.message(f"Loading profile “{name}”…")
+        self.run(load, loaded)
+
+    def delete_profile(self):
+        if self.busy or self.previous is not None:
+            return
+        try:
+            name = self.selected(self.profile_choice)
+        except ValueError as error:
+            self.profile_status.set_text(str(error))
+            return
+        dialog = Gtk.Dialog(
+            title="Delete profile?", transient_for=self, modal=True, destroy_with_parent=True)
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Delete", Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        dialog.get_content_area().append(Gtk.Label(
+            label=f"Delete profile “{name}”? This cannot be undone.",
+            wrap=True, margin_top=20, margin_bottom=20, margin_start=20, margin_end=20))
+
+        def finished(dialog, response):
+            try:
+                if response == Gtk.ResponseType.ACCEPT:
+                    self.profiles.delete(name)
+                    self.reload_profiles()
+                    self.message(f"Deleted profile “{name}”.")
+            except Exception as error:
+                self.message(error)
+            finally:
+                dialog.destroy()
+
+        dialog.connect("response", finished)
+        self.profile_popover.popdown()
+        dialog.present()
+
     def chooser(self, title, action, callback, default_name=None):
         if self.file_chooser is not None:
             self.file_chooser.present()
@@ -1020,7 +1134,7 @@ class DisplayWindow(Gtk.ApplicationWindow):
 
 class DisplayApplication(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="io.github.niri_display", flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        super().__init__(application_id="io.github.niri_display", flags=Gio.ApplicationFlags.NON_UNIQUE)
 
     def do_activate(self):
         window = self.get_active_window()
@@ -1029,5 +1143,16 @@ class DisplayApplication(Gtk.Application):
         window.present()
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Configure Niri displays and saved profiles.")
+    parser.add_argument(
+        "--profiles", action="store_true", help="Open the minimal saved-profile switcher")
+    args = parser.parse_args(argv)
+    if args.profiles:
+        from switcher import ProfileSwitcherApplication
+        return ProfileSwitcherApplication().run([])
+    return DisplayApplication().run([])
+
+
 if __name__ == "__main__":
-    raise SystemExit(DisplayApplication().run())
+    raise SystemExit(main())

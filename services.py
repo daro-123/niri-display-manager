@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import copy
 import json
 import math
 import os
@@ -10,7 +12,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from typing import Any, BinaryIO
+
+from backend import snapshot
 
 
 _MODE_PATTERN = re.compile(r"([0-9]+)x([0-9]+)@([0-9]+(?:\.[0-9]+)?)\Z")
@@ -143,6 +148,138 @@ class ConfigStore:
             return _validate_layout(layout, config=str(path))
         except ValueError as exc:
             raise RuntimeError(f"Corrupt config at '{path}': {exc}") from exc
+
+
+class ProfileStore:
+    """Persist named monitor layouts under the user configuration directory."""
+
+    def __init__(self, directory: Path | None = None):
+        if directory is None:
+            config_home = os.environ.get("XDG_CONFIG_HOME")
+            directory = Path(config_home) if config_home else Path.home() / ".config"
+            directory = directory / "niri-display" / "profiles"
+        self.directory = Path(directory)
+        self.config = ConfigStore()
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        if not isinstance(name, str):
+            raise ValueError("Profile name must be text.")
+        name = name.strip()
+        if not name:
+            raise ValueError("Profile name must not be empty.")
+        if any(unicodedata.category(character) == "Cc" for character in name):
+            raise ValueError("Profile name must not contain control characters.")
+        return name
+
+    @classmethod
+    def _filename(cls, name: str) -> str:
+        encoded = base64.urlsafe_b64encode(cls._normalize_name(name).encode("utf-8")).decode("ascii")
+        return f"{encoded}.json"
+
+    def list_names(self) -> list[str]:
+        names = []
+        try:
+            for path in self.directory.glob("*.json"):
+                try:
+                    raw = base64.urlsafe_b64decode(path.stem.encode("ascii"))
+                    name = raw.decode("utf-8")
+                    if self._filename(name) == path.name and path.is_file():
+                        names.append(name)
+                except (UnicodeError, ValueError):
+                    continue
+        except OSError:
+            return []
+        names.sort(key=str.casefold)
+        try:
+            with (self.directory / ".order.json").open(encoding="utf-8") as handle:
+                order = json.load(handle)
+        except FileNotFoundError:
+            return names
+        except (OSError, UnicodeError, ValueError) as error:
+            raise RuntimeError(f"Cannot read profile order: {error}") from error
+        if not isinstance(order, list) or any(not isinstance(name, str) for name in order):
+            raise RuntimeError("Profile order must be a list of names.")
+        available = set(names)
+        ordered = list(dict.fromkeys(name for name in order if name in available))
+        included = set(ordered)
+        return ordered + [name for name in names if name not in included]
+
+    def save_order(self, names: list[str]) -> None:
+        """Persist the displayed order without changing any profile layouts."""
+        if len(names) != len(set(names)) or set(names) != set(self.list_names()):
+            raise ValueError("Profiles changed. Reopen the picker before reordering.")
+        self.directory.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.directory,
+                prefix=".order.", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = handle.name
+                json.dump(names, handle, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.directory / ".order.json")
+            temporary = None
+        finally:
+            if temporary is not None:
+                os.unlink(temporary)
+
+    def save(self, name: str, layout: list[dict]) -> None:
+        filename = self._filename(name)
+        path = self.directory / filename
+        _validate_layout(layout, config=f"profile '{name}'")
+        self.directory.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            raise FileExistsError(f"Profile '{name}' already exists.")
+
+        fd, temporary = tempfile.mkstemp(prefix=".profile.", suffix=".tmp", dir=self.directory)
+        os.close(fd)
+        try:
+            self.config.save(Path(temporary), layout)
+            try:
+                os.link(temporary, path)
+            except FileExistsError as exc:
+                raise FileExistsError(f"Profile '{name}' already exists.") from exc
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def load(self, name: str) -> list[dict]:
+        name = self._normalize_name(name)
+        path = self.directory / self._filename(name)
+        try:
+            return self.config.load(path)
+        except RuntimeError as exc:
+            if not path.exists():
+                raise RuntimeError(f"Profile '{name}' does not exist.") from exc
+            raise
+
+    def delete(self, name: str) -> None:
+        name = self._normalize_name(name)
+        path = self.directory / self._filename(name)
+        try:
+            path.unlink()
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Profile '{name}' does not exist.") from exc
+
+
+def merge_profile(layout: list[dict], outputs: dict[str, Any]) -> list[dict]:
+    """Merge saved profile rows into current outputs without dropping connected displays."""
+    _validate_layout(layout, config="profile")
+    saved_names = {output["name"] for output in layout}
+    missing = sorted(saved_names - outputs.keys())
+    if missing:
+        raise ValueError("Profile has missing monitors: " + ", ".join(missing))
+
+    current = snapshot(outputs)
+    by_name = {output["name"]: output for output in layout}
+    merged = [copy.deepcopy(by_name.get(output["name"], output)) for output in current]
+    return _validate_layout(merged, config="merged profile")
 
 
 
