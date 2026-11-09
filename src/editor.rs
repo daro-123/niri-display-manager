@@ -144,6 +144,16 @@ impl Editor {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        // Resolve the two menu arrows directly, without indexing the desktop icon theme.
+        let arrows = gtk::CssProvider::new();
+        arrows.load_from_string(
+            "#display-root menubutton arrow { -gtk-icon-source: -gtk-recolor(url(\"resource:///org/gtk/libgtk/icons/scalable/actions/pan-down-symbolic.svg\")); }",
+        );
+        gtk::style_context_add_provider_for_display(
+            &WidgetExt::display(&window),
+            &arrows,
+            gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
+        );
         let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
         for side in ["top", "bottom", "start", "end"] {
             root.set_widget_name("display-root");
@@ -1287,14 +1297,16 @@ impl Editor {
             if self.mirror_source_first {
                 "No other connected display. Connect a target first.".into()
             } else {
-                "No active source display. Enable a source and apply its display settings first.".into()
+                "No active source display. Enable a source and apply its display settings first."
+                    .into()
             }
         } else {
             "Not active · The target will be enabled automatically when mirroring starts.".into()
         };
         self.mirror_status.set_text(&status);
-        self.mirror_start
-            .set_sensitive(multiple && active && self.mirror_peer.selected_item().is_some() && !running);
+        self.mirror_start.set_sensitive(
+            multiple && active && self.mirror_peer.selected_item().is_some() && !running,
+        );
         self.mirror_stop.set_visible(running);
         self.mirror_start.set_visible(!running);
     }
@@ -2062,7 +2074,11 @@ impl Editor {
                     Ok(outputs) => (Some(outputs), mirrors.start(&source, &target)),
                     Err(error) => (None, Err(error)),
                 };
-                Ok((mirrors, outputs, result.map_err(|error| format!("{error:#}"))))
+                Ok((
+                    mirrors,
+                    outputs,
+                    result.map_err(|error| format!("{error:#}")),
+                ))
             },
             move |e, (mirrors, outputs, result)| {
                 let mut s = e.borrow_mut();
@@ -2070,13 +2086,16 @@ impl Editor {
                 if let Some(outputs) = outputs {
                     if let Ok(actual) = snapshot(&outputs) {
                         if let Some(target) = actual.iter().find(|row| row.name == success_pair.1) {
-                            let baseline = s.baseline.as_ref().and_then(|rows| {
-                                rows.iter().find(|row| row.name == target.name)
-                            });
+                            let baseline = s
+                                .baseline
+                                .as_ref()
+                                .and_then(|rows| rows.iter().find(|row| row.name == target.name));
                             if baseline.is_some_and(|row| !row.enabled) {
-                                let unchanged = s.layout.iter().find(|row| row.name == target.name)
-                                    == baseline;
-                                if let Some(row) = s.layout.iter_mut().find(|row| row.name == target.name) {
+                                let unchanged =
+                                    s.layout.iter().find(|row| row.name == target.name) == baseline;
+                                if let Some(row) =
+                                    s.layout.iter_mut().find(|row| row.name == target.name)
+                                {
                                     if unchanged {
                                         *row = target.clone();
                                     } else {

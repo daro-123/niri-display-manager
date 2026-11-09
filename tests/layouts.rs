@@ -297,7 +297,11 @@ fn client_and_daemon_cases() {
     set_outputs(root, &connected);
     let mut rows = snapshot(&connected).unwrap();
     let activated = outputs(&[("DP-1", true, "Flipped90"), ("DP-2", true, "Normal")]);
-    fs::write(root.join("activated.json"), serde_json::to_vec(&activated).unwrap()).unwrap();
+    fs::write(
+        root.join("activated.json"),
+        serde_json::to_vec(&activated).unwrap(),
+    )
+    .unwrap();
     assert_eq!(client.prepare_mirror("DP-1", "DP-2").unwrap(), activated);
     assert_eq!(commands(root), vec![vec!["msg", "output", "DP-2", "on"]]);
     fs::remove_file(root.join("activated.json")).unwrap();
@@ -312,7 +316,10 @@ fn client_and_daemon_cases() {
     ] {
         set_outputs(root, &connected);
         assert!(client.prepare_mirror(source, target).is_err());
-        assert!(commands(root).is_empty(), "invalid mirror changed compositor");
+        assert!(
+            commands(root).is_empty(),
+            "invalid mirror changed compositor"
+        );
     }
     set_outputs(root, &connected);
     rows[0].enabled = false;

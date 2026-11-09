@@ -320,9 +320,9 @@ impl NiriClient {
             }
         }
         let active = |outputs: &Outputs, name: &str| {
-            outputs.get(name).is_some_and(|output| {
-                output.get("logical").is_some_and(|value| !value.is_null())
-            })
+            outputs
+                .get(name)
+                .is_some_and(|output| output.get("logical").is_some_and(|value| !value.is_null()))
         };
         if !active(&outputs, source) {
             bail!("{source} is not active. Enable the source and apply its display settings before mirroring.");

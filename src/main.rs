@@ -63,11 +63,29 @@ fn run() -> Result<i32> {
         return Ok(0);
     }
 
+    // GTK searches every entry, including duplicates added by shell integration.
+    if let Some(value) = std::env::var_os("XDG_DATA_DIRS") {
+        let mut directories = Vec::new();
+        let mut repeated = false;
+        for directory in std::env::split_paths(&value) {
+            if directories.contains(&directory) {
+                repeated = true;
+            } else {
+                directories.push(directory);
+            }
+        }
+        if repeated {
+            std::env::set_var("XDG_DATA_DIRS", std::env::join_paths(directories)?);
+        }
+    }
     let editor_renderer = std::env::var_os("GSK_RENDERER");
-    if profiles && editor_renderer.is_none() {
-        // This small, short-lived window does not benefit from GPU initialization.
+    if editor_renderer.is_none() {
+        // CPU rendering avoids GPU initialization for these small GTK interfaces.
         std::env::set_var("GSK_RENDERER", "cairo");
     }
+    gtk::init()?;
+    // Skip GTK's theme-wide app-ID lookup; clear this placeholder at startup.
+    gtk::Window::set_default_icon_name("");
     let app = gtk::Application::builder()
         .application_id(if profiles {
             "io.github.niri_display.profiles"
@@ -76,6 +94,12 @@ fn run() -> Result<i32> {
         })
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    // No resources are bundled; registering an empty icon path reloads the theme.
+    app.set_resource_base_path(None);
+    app.connect_startup(|_| {
+        // GTK's Rust binding does not expose the nullable C argument.
+        unsafe { gtk::ffi::gtk_window_set_default_icon_name(std::ptr::null()) };
+    });
     app.connect_activate(move |app| {
         if let Some(window) = app.active_window() {
             window.present();
