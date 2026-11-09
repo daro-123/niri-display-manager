@@ -1,14 +1,15 @@
 [tasks.test]
-description = "Run layout tests and check Python syntax"
+description = "Run Rust regression tests"
 dir = "{{config_root}}"
-run = """
-set -eu
-python3 -m unittest discover -s tests -v
-python3 -m py_compile app.py editor.py backend.py services.py daemon.py switcher.py
-"""
+run = "cargo test --locked"
+
+[tasks.build]
+description = "Build the native Rust application"
+dir = "{{config_root}}"
+run = "cargo build --release --locked"
 
 [tasks.install]
-description = "Install Niri Displays for the current user"
+description = "Build and install Niri Displays for the current user"
 dir = "{{config_root}}"
 run = '''
 set -eu
@@ -16,14 +17,20 @@ data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/niri-display"
 bin_dir="$HOME/.local/bin"
 launcher="$bin_dir/niri-display"
 if [ -e "$launcher" ] || [ -L "$launcher" ]; then
-    if [ ! -L "$launcher" ] || [ "$(readlink "$launcher")" != "$data_dir/app.py" ]; then
+    if [ ! -L "$launcher" ]; then
         printf 'Refusing to replace existing launcher: %s\n' "$launcher" >&2
         exit 1
     fi
+    case "$(readlink "$launcher")" in
+        "$data_dir/app.py"|"$data_dir/niri-display") ;;
+        *) printf 'Refusing to replace existing launcher: %s\n' "$launcher" >&2; exit 1 ;;
+    esac
 fi
+cargo build --release --locked
 install -d "$data_dir" "$bin_dir"
-install -m 755 app.py "$data_dir/app.py"
-install -m 644 editor.py backend.py services.py daemon.py switcher.py "$data_dir/"
-ln -sfn "$data_dir/app.py" "$launcher"
+install -m 755 target/release/niri-display "$data_dir/niri-display.new"
+mv -f "$data_dir/niri-display.new" "$data_dir/niri-display"
+ln -sfn "$data_dir/niri-display" "$launcher"
 printf 'Installed %s\nAdd %s to PATH, then run niri-display.\n' "$launcher" "$bin_dir"
+printf 'If automatic restore was enabled, run niri-display --daemon --enable to migrate its service.\n'
 '''

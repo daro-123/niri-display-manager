@@ -1,0 +1,19 @@
+[package]
+name = "niri-display"
+version = "0.1.0"
+edition = "2021"
+description = "GTK display editor and profile switcher for Niri"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
