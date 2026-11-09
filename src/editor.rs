@@ -313,8 +313,7 @@ impl Editor {
         let mirror_start = gtk::Button::with_label("Start mirroring now");
         mirror_start.add_css_class("suggested-action");
         mirror_box.append(&mirror_start);
-        let mirror_stop = gtk::Button::with_label("Stop mirroring now");
-        mirror_box.append(&mirror_stop);
+        let mirror_stop = gtk::Button::with_label("Stop mirroring");
         mirror_popover.set_child(Some(&mirror_box));
         mirror_menu.set_popover(Some(&mirror_popover));
 
@@ -824,6 +823,9 @@ impl Editor {
         if let Some(parent) = self.mirror_menu.parent().and_downcast::<gtk::Box>() {
             parent.remove(&self.mirror_menu);
         }
+        if let Some(parent) = self.mirror_stop.parent().and_downcast::<gtk::Box>() {
+            parent.remove(&self.mirror_stop);
+        }
         clear_box(&self.dock);
         clear_box(&self.advanced);
         self.summary.set_text(&format!(
@@ -926,7 +928,10 @@ impl Editor {
         resolution.set_sensitive(row.enabled);
         refresh.set_sensitive(row.enabled);
         scale.set_sensitive(row.enabled);
-        self.add_control("Display mode", &self.mirror_menu);
+        let mirror_control = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        mirror_control.append(&self.mirror_menu);
+        mirror_control.append(&self.mirror_stop);
+        self.add_control("Display mode", &mirror_control);
         let advanced_toggle = gtk::ToggleButton::with_label("Advanced");
         advanced_toggle.set_active(self.drawer.reveals_child());
         self.dock.append(&advanced_toggle);
@@ -1202,11 +1207,13 @@ impl Editor {
             .layout
             .iter()
             .filter(|item| {
-                item.enabled
-                    && Some(&item.name) != self.selected.as_ref()
-                    && self.outputs.get(&item.name).is_some_and(|output| {
-                        output.get("logical").is_some_and(|value| !value.is_null())
-                    })
+                Some(&item.name) != self.selected.as_ref()
+                    && self.outputs.contains_key(&item.name)
+                    && (self.mirror_source_first
+                        || item.enabled
+                            && self.outputs[&item.name]
+                                .get("logical")
+                                .is_some_and(|value| !value.is_null()))
             })
             .map(|item| item.name.clone())
             .collect::<Vec<_>>();
@@ -1231,11 +1238,12 @@ impl Editor {
             .iter()
             .find(|i| Some(&i.name) == self.selected.as_ref());
         let active = selected.is_some_and(|i| {
-            i.enabled
-                && self
-                    .outputs
-                    .get(&i.name)
-                    .is_some_and(|o| o.get("logical").is_some_and(|v| !v.is_null()))
+            self.outputs.contains_key(&i.name)
+                && (!self.mirror_source_first
+                    || i.enabled
+                        && self.outputs[&i.name]
+                            .get("logical")
+                            .is_some_and(|value| !value.is_null()))
         });
         let role = if self.mirror_source_first {
             "Source"
@@ -1262,34 +1270,31 @@ impl Editor {
             "Choose a {peer_role} display; selected display is the {}",
             role.to_lowercase()
         )));
-        self.mirror_menu.set_label(
-            if running
-                && self.selected.as_ref().is_some_and(|n| {
-                    self.mirror_pair
-                        .as_ref()
-                        .is_some_and(|p| p.0 == *n || p.1 == *n)
-                })
-            {
-                "Mirroring"
-            } else {
-                "Independent"
-            },
-        );
+        if running {
+            if let Some(popover) = self.mirror_menu.popover() {
+                popover.popdown();
+            }
+        }
+        self.mirror_menu.set_visible(!running);
+        let multiple = self.outputs.len() > 1;
         let status = if let Some((a, b)) = &self.mirror_pair {
             format!("Active · {a} → {b}. Stop this mirror before starting another.")
+        } else if !multiple {
+            "Mirroring requires at least two connected displays.".into()
         } else if !active {
-            format!(
-                "Enable this {} and apply its display settings before mirroring.",
-                role.to_lowercase()
-            )
+            "Enable this source and apply its display settings before mirroring.".into()
         } else if self.mirror_peer.selected_item().is_none() {
-            format!("No other active display. Connect and enable a {peer_role} first.")
+            if self.mirror_source_first {
+                "No other connected display. Connect a target first.".into()
+            } else {
+                "No active source display. Enable a source and apply its display settings first.".into()
+            }
         } else {
-            "Not active · Source content will appear on the target display.".into()
+            "Not active · The target will be enabled automatically when mirroring starts.".into()
         };
         self.mirror_status.set_text(&status);
         self.mirror_start
-            .set_sensitive(active && self.mirror_peer.selected_item().is_some() && !running);
+            .set_sensitive(multiple && active && self.mirror_peer.selected_item().is_some() && !running);
         self.mirror_stop.set_visible(running);
         self.mirror_start.set_visible(!running);
     }
@@ -2052,23 +2057,43 @@ impl Editor {
         Self::run(
             e,
             move || {
-                let result = (|| -> Result<()> {
-                    let outputs = client.outputs()?;
-                    for name in [&source, &target] {
-                        if !outputs.get(name).is_some_and(|output| {
-                            output.get("logical").is_some_and(|value| !value.is_null())
-                        }) {
-                            bail!("{name} is not active. Apply the layout before mirroring.");
-                        }
-                    }
-                    mirrors.start(&source, &target)
-                })()
-                .map_err(|error| format!("{error:#}"));
-                Ok((mirrors, result))
+                let outputs = client.prepare_mirror(&source, &target);
+                let (outputs, result) = match outputs {
+                    Ok(outputs) => (Some(outputs), mirrors.start(&source, &target)),
+                    Err(error) => (None, Err(error)),
+                };
+                Ok((mirrors, outputs, result.map_err(|error| format!("{error:#}"))))
             },
-            move |e, (mirrors, result)| {
+            move |e, (mirrors, outputs, result)| {
                 let mut s = e.borrow_mut();
                 s.mirrors = mirrors;
+                if let Some(outputs) = outputs {
+                    if let Ok(actual) = snapshot(&outputs) {
+                        if let Some(target) = actual.iter().find(|row| row.name == success_pair.1) {
+                            let baseline = s.baseline.as_ref().and_then(|rows| {
+                                rows.iter().find(|row| row.name == target.name)
+                            });
+                            if baseline.is_some_and(|row| !row.enabled) {
+                                let unchanged = s.layout.iter().find(|row| row.name == target.name)
+                                    == baseline;
+                                if let Some(row) = s.layout.iter_mut().find(|row| row.name == target.name) {
+                                    if unchanged {
+                                        *row = target.clone();
+                                    } else {
+                                        row.enabled = true;
+                                    }
+                                }
+                                if let Some(row) = s.baseline.as_mut().and_then(|rows| {
+                                    rows.iter_mut().find(|row| row.name == target.name)
+                                }) {
+                                    *row = target.clone();
+                                }
+                            }
+                        }
+                    }
+                    s.outputs = outputs;
+                    s.rebuild();
+                }
                 match result {
                     Ok(()) => {
                         s.mirror_pair = Some(success_pair.clone());

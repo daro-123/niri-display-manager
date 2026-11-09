@@ -239,7 +239,7 @@ fn compositor_mutation_safety_and_daemon_transitions() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("niri");
-    fs::write(&binary, "#!/bin/sh\nif [ \"$2\" = --json ]; then cat \"$NIRI_DISPLAY_TEST_ROOT/outputs.json\"; else printf '%s\\t' \"$@\" >> \"$NIRI_DISPLAY_TEST_ROOT/commands\"; printf '\\n' >> \"$NIRI_DISPLAY_TEST_ROOT/commands\"; fi\n").unwrap();
+    fs::write(&binary, "#!/bin/sh\nif [ \"$2\" = --json ]; then cat \"$NIRI_DISPLAY_TEST_ROOT/outputs.json\"; else printf '%s\\t' \"$@\" >> \"$NIRI_DISPLAY_TEST_ROOT/commands\"; printf '\\n' >> \"$NIRI_DISPLAY_TEST_ROOT/commands\"; if [ \"$4\" = on ] && [ -f \"$NIRI_DISPLAY_TEST_ROOT/activated.json\" ]; then cp \"$NIRI_DISPLAY_TEST_ROOT/activated.json\" \"$NIRI_DISPLAY_TEST_ROOT/outputs.json\"; fi; fi\n").unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
     let result = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -296,6 +296,25 @@ fn client_and_daemon_cases() {
     let connected = outputs(&[("DP-1", true, "Flipped90"), ("DP-2", false, "Normal")]);
     set_outputs(root, &connected);
     let mut rows = snapshot(&connected).unwrap();
+    let activated = outputs(&[("DP-1", true, "Flipped90"), ("DP-2", true, "Normal")]);
+    fs::write(root.join("activated.json"), serde_json::to_vec(&activated).unwrap()).unwrap();
+    assert_eq!(client.prepare_mirror("DP-1", "DP-2").unwrap(), activated);
+    assert_eq!(commands(root), vec![vec!["msg", "output", "DP-2", "on"]]);
+    fs::remove_file(root.join("activated.json")).unwrap();
+    set_outputs(root, &activated);
+    assert_eq!(client.prepare_mirror("DP-1", "DP-2").unwrap(), activated);
+    assert!(commands(root).is_empty(), "active target was reconfigured");
+    for (connected, source, target) in [
+        (outputs(&[("DP-1", true, "Normal")]), "DP-1", "DP-2"),
+        (connected.clone(), "DP-1", "DP-1"),
+        (connected.clone(), "DP-1", "missing"),
+        (connected.clone(), "DP-2", "DP-1"),
+    ] {
+        set_outputs(root, &connected);
+        assert!(client.prepare_mirror(source, target).is_err());
+        assert!(commands(root).is_empty(), "invalid mirror changed compositor");
+    }
+    set_outputs(root, &connected);
     rows[0].enabled = false;
     rows[1].enabled = true;
     client.apply(&rows).unwrap();

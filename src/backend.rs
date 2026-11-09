@@ -306,6 +306,49 @@ impl NiriClient {
             .cloned()
             .ok_or_else(|| anyhow!("Niri outputs response was not a JSON object"))
     }
+    pub fn prepare_mirror(&self, source: &str, target: &str) -> Result<Outputs> {
+        let mut outputs = self.outputs()?;
+        if outputs.len() < 2 {
+            bail!("Mirroring requires at least two connected displays.");
+        }
+        if source == target {
+            bail!("Mirror source and target outputs must be different.");
+        }
+        for name in [source, target] {
+            if !outputs.contains_key(name) {
+                bail!("Output is not connected: {name}");
+            }
+        }
+        let active = |outputs: &Outputs, name: &str| {
+            outputs.get(name).is_some_and(|output| {
+                output.get("logical").is_some_and(|value| !value.is_null())
+            })
+        };
+        if !active(&outputs, source) {
+            bail!("{source} is not active. Enable the source and apply its display settings before mirroring.");
+        }
+        if !active(&outputs, target) {
+            self.command(&["output", target, "on"])?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                outputs = self.outputs()?;
+                if !active(&outputs, source) {
+                    bail!("Mirror source {source} is no longer active.");
+                }
+                if active(&outputs, target) {
+                    break;
+                }
+                if !outputs.contains_key(target) {
+                    bail!("Output is not connected: {target}");
+                }
+                if std::time::Instant::now() >= deadline {
+                    bail!("Mirror target {target} did not become active.");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        Ok(outputs)
+    }
     pub fn apply(&self, layout: &[OutputConfig]) -> Result<()> {
         if layout.is_empty() {
             bail!("Layout must be a non-empty list");
