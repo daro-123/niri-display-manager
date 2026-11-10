@@ -1,6 +1,6 @@
 use niri_display::backend::{dimensions, snapshot, Layout, NiriClient, OutputConfig, Outputs};
 use niri_display::daemon::{LayoutMemory, RestoreDaemon};
-use niri_display::services::{merge_profile, ConfigStore, ProfileStore};
+use niri_display::services::{merge_profile, ConfigStore, Profile, ProfileStore};
 use serde_json::{json, Value};
 use std::{fs, path::Path, process::Command};
 
@@ -172,15 +172,18 @@ fn invalid_save_preserves_existing_file() {
 fn profiles_preserve_unicode_names_order_and_no_overwrite() {
     let temp = tempfile::tempdir().unwrap();
     let store = ProfileStore::new(temp.path().into());
-    let original = layout();
+    let original = Profile {
+        outputs: layout(),
+        mirror: None,
+    };
     fs::write(
         temp.path().join("RGVzayAvIPCflqU=.json"),
-        serde_json::to_vec(&original).unwrap(),
+        serde_json::to_vec(&original.outputs).unwrap(),
     )
     .unwrap();
     assert_eq!(store.load("Desk / 🖥").unwrap(), original);
     let mut changed = original.clone();
-    changed[0].x = 10;
+    changed.outputs[0].x = 10;
     assert!(store.save("Desk / 🖥", &changed).is_err());
     assert_eq!(store.load("Desk / 🖥").unwrap(), original);
     store.save("  Travel  ", &original).unwrap();
@@ -195,11 +198,18 @@ fn profiles_preserve_unicode_names_order_and_no_overwrite() {
 
 #[test]
 fn profile_merge_keeps_extra_monitors_and_rejects_missing_saved_monitors() {
-    let rows = snapshot(&outputs(&[("DP-1", true, "Normal")])).unwrap();
+    let rows = Profile {
+        outputs: snapshot(&outputs(&[("DP-1", true, "Normal")])).unwrap(),
+        mirror: None,
+    };
     let current = outputs(&[("DP-1", true, "Normal"), ("DP-2", true, "Normal")]);
     let merged = merge_profile(&rows, &current).unwrap();
-    assert_eq!(merged[1], snapshot(&current).unwrap()[1]);
-    assert!(merge_profile(&layout(), &outputs(&[("DP-1", true, "Normal")])).is_err());
+    assert_eq!(merged.outputs[1], snapshot(&current).unwrap()[1]);
+    let saved = Profile {
+        outputs: layout(),
+        mirror: None,
+    };
+    assert!(merge_profile(&saved, &outputs(&[("DP-1", true, "Normal")])).is_err());
 }
 
 #[test]
@@ -239,7 +249,7 @@ fn compositor_mutation_safety_and_daemon_transitions() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("niri");
-    fs::write(&binary, "#!/bin/sh\nif [ \"$2\" = --json ]; then cat \"$NIRI_DISPLAY_TEST_ROOT/outputs.json\"; else printf '%s\\t' \"$@\" >> \"$NIRI_DISPLAY_TEST_ROOT/commands\"; printf '\\n' >> \"$NIRI_DISPLAY_TEST_ROOT/commands\"; if [ \"$4\" = on ] && [ -f \"$NIRI_DISPLAY_TEST_ROOT/activated.json\" ]; then cp \"$NIRI_DISPLAY_TEST_ROOT/activated.json\" \"$NIRI_DISPLAY_TEST_ROOT/outputs.json\"; fi; fi\n").unwrap();
+    fs::write(&binary, "#!/bin/sh\nroot=\"$NIRI_DISPLAY_TEST_ROOT\"\nif [ \"$2\" = --json ]; then\n  if [ \"$3\" = workspaces ]; then\n    if [ -f \"$root/workspaces-after.json\" ] && grep -q off \"$root/commands\" 2>/dev/null; then cat \"$root/workspaces-after.json\";\n    elif [ -f \"$root/workspaces.json\" ]; then cat \"$root/workspaces.json\";\n    else printf '[]'; fi;\n  elif [ \"$3\" = focused-output ]; then\n    if [ -f \"$root/focused-output.json\" ]; then cat \"$root/focused-output.json\"; else printf '{\"name\":null}'; fi;\n  elif [ -f \"$root/outputs-after.json\" ] && grep -q off \"$root/commands\" 2>/dev/null; then cat \"$root/outputs-after.json\";\n  else cat \"$root/outputs.json\"; fi;\nelse\n  printf '%s\\t' \"$@\" >> \"$root/commands\"; printf '\\n' >> \"$root/commands\";\n  if [ \"$4\" = on ] && [ -f \"$root/activated.json\" ]; then cp \"$root/activated.json\" \"$root/outputs.json\"; fi;\nfi\n").unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
     let result = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -321,6 +331,96 @@ fn client_and_daemon_cases() {
             "invalid mirror changed compositor"
         );
     }
+    // An inactive mirror source is enabled alone first, so Niri moves the
+    // workspaces onto it; the previous workspace is focused there, then the
+    // full layout and destination follow.
+    set_outputs(root, &connected);
+    fs::write(
+        root.join("workspaces.json"),
+        serde_json::to_vec(&json!([
+            {"id": 1, "idx": 1, "name": null, "output": "DP-1", "is_urgent": false, "is_active": true, "is_focused": true},
+            {"id": 2, "idx": 2, "name": null, "output": "DP-1", "is_urgent": false, "is_active": false, "is_focused": false}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    // Once DP-1 is disabled, Niri focuses DP-2's empty workspace instead.
+    fs::write(
+        root.join("workspaces-after.json"),
+        serde_json::to_vec(&json!([
+            {"id": 1, "idx": 1, "name": null, "output": "DP-2", "is_urgent": false, "is_active": false, "is_focused": false},
+            {"id": 9, "idx": 2, "name": null, "output": "DP-2", "is_urgent": false, "is_active": true, "is_focused": true}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(root.join("focused-output.json"), r#"{"name":"DP-2"}"#).unwrap();
+    fs::write(
+        root.join("outputs-after.json"),
+        serde_json::to_vec(&outputs(&[
+            ("DP-1", false, "Flipped90"),
+            ("DP-2", true, "Normal"),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut mirror_rows = snapshot(&connected).unwrap();
+    mirror_rows[1].enabled = true;
+    client.apply_with_source(&mirror_rows, "DP-2").unwrap();
+    let log = commands(root);
+    let isolated_on = log
+        .iter()
+        .position(|line| line == &["msg", "output", "DP-2", "on"])
+        .unwrap();
+    let isolated_off = log
+        .iter()
+        .position(|line| line == &["msg", "output", "DP-1", "off"])
+        .unwrap();
+    let focused = log
+        .iter()
+        .position(|line| line == &["msg", "action", "focus-workspace", "1"])
+        .unwrap();
+    assert!(
+        isolated_on < isolated_off,
+        "source was not enabled before other displays were disabled"
+    );
+    assert!(
+        isolated_off < focused,
+        "workspace was focused before the source became the only output"
+    );
+    let destination_on = log
+        .iter()
+        .skip(isolated_off + 1)
+        .position(|line| line == &["msg", "output", "DP-1", "on"])
+        .map(|index| index + isolated_off + 1)
+        .unwrap();
+    assert!(
+        focused < destination_on,
+        "destination was enabled before the source workspace was focused"
+    );
+    fs::remove_file(root.join("workspaces.json")).unwrap();
+    fs::remove_file(root.join("workspaces-after.json")).unwrap();
+    fs::remove_file(root.join("focused-output.json")).unwrap();
+    fs::remove_file(root.join("outputs-after.json")).unwrap();
+    set_outputs(root, &connected);
+    client.apply_with_source(&mirror_rows, "DP-1").unwrap();
+    let log = commands(root);
+    assert_eq!(
+        log.iter()
+            .filter(|line| **line == ["msg", "output", "DP-2", "on"])
+            .count(),
+        1,
+        "active source was applied more than once"
+    );
+    set_outputs(root, &connected);
+    assert!(client.apply_with_source(&mirror_rows, "missing").is_err());
+    assert!(client
+        .apply_with_source(&snapshot(&connected).unwrap(), "DP-2")
+        .is_err());
+    assert!(
+        commands(root).is_empty(),
+        "invalid mirror source changed compositor"
+    );
     set_outputs(root, &connected);
     rows[0].enabled = false;
     rows[1].enabled = true;
@@ -338,6 +438,82 @@ fn client_and_daemon_cases() {
         on < off,
         "disabled working display before replacement was enabled"
     );
+    // Disabling the focused output moves its workspaces, but Niri leaves the
+    // remaining output's empty workspace focused. The previous workspace must
+    // be focused again once the display is off.
+    set_outputs(root, &connected);
+    fs::write(
+        root.join("workspaces.json"),
+        serde_json::to_vec(&json!([
+            {"id": 7, "idx": 1, "name": null, "output": "DP-1", "is_urgent": false, "is_active": true, "is_focused": true, "active_window_id": 3}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("workspaces-after.json"),
+        serde_json::to_vec(&json!([
+            {"id": 8, "idx": 1, "name": null, "output": "DP-2", "is_urgent": false, "is_active": true, "is_focused": true},
+            {"id": 7, "idx": 2, "name": null, "output": "DP-2", "is_urgent": false, "is_active": false, "is_focused": false}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(root.join("focused-output.json"), r#"{"name":"DP-2"}"#).unwrap();
+    fs::write(
+        root.join("outputs-after.json"),
+        serde_json::to_vec(&outputs(&[
+            ("DP-1", false, "Normal"),
+            ("DP-2", true, "Normal"),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut rows = snapshot(&connected).unwrap();
+    rows[0].enabled = false;
+    rows[1].enabled = true;
+    client.apply(&rows).unwrap();
+    let log = commands(root);
+    let off = log
+        .iter()
+        .position(|line| line == &["msg", "output", "DP-1", "off"])
+        .unwrap();
+    let restored = log
+        .iter()
+        .position(|line| line == &["msg", "action", "focus-workspace", "2"])
+        .unwrap();
+    assert!(
+        off < restored,
+        "previous workspace was focused before the display was disabled"
+    );
+    // No redundant focus change when the workspace already holds focus.
+    set_outputs(root, &connected);
+    fs::write(
+        root.join("workspaces-after.json"),
+        serde_json::to_vec(&json!([
+            {"id": 7, "idx": 2, "name": null, "output": "DP-2", "is_urgent": false, "is_active": true, "is_focused": true}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    client.apply(&rows).unwrap();
+    assert!(
+        commands(root).iter().all(|line| {
+            !(line.len() >= 3
+                && line[0] == "msg"
+                && line[1] == "action"
+                && line[2] == "focus-workspace")
+        }),
+        "focused workspace was changed even though it kept focus"
+    );
+    for name in [
+        "workspaces.json",
+        "workspaces-after.json",
+        "focused-output.json",
+        "outputs-after.json",
+    ] {
+        fs::remove_file(root.join(name)).unwrap();
+    }
     for change in [0, 1, 2, 3] {
         set_outputs(root, &connected);
         let mut rows = snapshot(&connected).unwrap();

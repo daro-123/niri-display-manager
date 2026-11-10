@@ -1,6 +1,7 @@
 use crate::backend::{dimensions, snapshot, Layout, NiriClient, OutputConfig, Outputs};
 use crate::daemon::{self, LayoutMemory};
-use crate::services::{merge_profile, ConfigStore, MirrorManager, ProfileStore};
+use crate::mirror::{MirrorConfig, MirrorManager};
+use crate::services::{merge_profile, ConfigStore, Profile, ProfileStore};
 use anyhow::{anyhow, bail, Result};
 use gtk::cairo;
 use gtk::gdk;
@@ -21,10 +22,6 @@ struct CanvasRect {
     width: f64,
     height: f64,
     ratio: f64,
-}
-enum ApplyOutcome {
-    Applied(Layout),
-    RestoreFailed(Layout, String),
 }
 
 struct MonitorControls<'a> {
@@ -55,9 +52,9 @@ struct Editor {
     outputs: Outputs,
     layout: Layout,
     baseline: Option<Layout>,
-    previous: Option<Layout>,
+    previous: Option<Profile>,
     selected: Option<String>,
-    mirror_pair: Option<(String, String)>,
+    mirror_pair: Option<MirrorConfig>,
     mirror_source_first: bool,
     busy: bool,
     closing: bool,
@@ -200,7 +197,7 @@ impl Editor {
         let save_profile = gtk::Button::with_label("Save current edits");
         profile_box.append(&save_profile);
         profile_box.append(&dim_label(
-            "Saves display settings, including unapplied edits. Mirroring is not saved.",
+            "Saves display settings, including unapplied edits, and the active mirror.",
         ));
         let profile_status = gtk::Label::new(None);
         profile_status.set_xalign(0.0);
@@ -318,7 +315,7 @@ impl Editor {
         mirror_status.set_wrap(true);
         mirror_box.append(&mirror_status);
         mirror_box.append(&dim_label(
-            "Mirroring starts immediately. Apply changes affects display settings only.",
+            "Mirroring starts immediately. Display changes suspend and resume mirroring.",
         ));
         let mirror_start = gtk::Button::with_label("Start mirroring now");
         mirror_start.add_css_class("suggested-action");
@@ -687,6 +684,116 @@ impl Editor {
     {
         Self::run_with_ui_lock(e, true, action, success);
     }
+    fn apply_profile_transaction(
+        e: &Rc<RefCell<Self>>,
+        profile: Profile,
+        confirm: bool,
+        message: &'static str,
+    ) {
+        let (client, mut mirrors) = {
+            let mut s = e.borrow_mut();
+            if s.busy {
+                return;
+            }
+            (s.client.clone(), std::mem::take(&mut s.mirrors))
+        };
+        let desired = profile.clone();
+        Self::run(
+            e,
+            move || {
+                let (previous, result) = if confirm {
+                    match Profile::capture(&client, &mut mirrors) {
+                        Ok(previous) => match profile.apply(&client, &mut mirrors) {
+                            Ok(()) => (Some(previous), Ok(())),
+                            Err(error) => match previous.apply(&client, &mut mirrors) {
+                                Ok(()) => (None, Err(format!("{error:#}; previous settings and mirror restored"))),
+                                Err(restore) => (Some(previous), Err(format!("{error:#}; restoring previous settings and mirror failed: {restore:#}"))),
+                            },
+                        },
+                        Err(error) => (None, Err(format!("{error:#}"))),
+                    }
+                } else {
+                    match profile.apply(&client, &mut mirrors) {
+                        Ok(()) => (None, Ok(())),
+                        Err(error) => (
+                            Some(profile),
+                            Err(format!(
+                                "Could not restore previous settings and mirror: {error:#}"
+                            )),
+                        ),
+                    }
+                };
+                Ok((mirrors, previous, result))
+            },
+            move |e, (mirrors, previous, result)| {
+                let mut s = e.borrow_mut();
+                s.mirrors = mirrors;
+                s.sync_mirror_state();
+                match result {
+                    Ok(()) if confirm => {
+                        s.previous = previous;
+                        s.remaining = 20;
+                        s.set_busy(false);
+                        s.confirm_label
+                            .set_text("Previous settings restore in 20 seconds");
+                        s.confirm_progress.set_fraction(1.0);
+                        s.confirm_keep.set_sensitive(true);
+                        s.confirm_revert.set_label("Revert now");
+                        s.confirm.present();
+                        s.confirm_revert.grab_focus();
+                        s.root.add_css_class("confirmation-pending");
+                        s.message(message);
+                        drop(s);
+                        let weak = weak(e);
+                        e.borrow_mut().confirm_timer =
+                            Some(glib::timeout_add_seconds_local(1, move || {
+                                if let Some(e) = weak.upgrade() {
+                                    Self::tick(&e)
+                                } else {
+                                    glib::ControlFlow::Break
+                                }
+                            }));
+                    }
+                    Ok(()) => {
+                        s.previous = None;
+                        s.confirm.set_visible(false);
+                        s.root.remove_css_class("confirmation-pending");
+                        s.editor_area.set_sensitive(true);
+                        let closing = s.closing;
+                        if closing {
+                            if let Some(timer) = s.mirror_timer.take() {
+                                timer.remove();
+                            }
+                        } else {
+                            s.layout = desired.outputs.clone();
+                            s.baseline = Some(desired.outputs);
+                            s.rebuild();
+                        }
+                        let window = s.window.clone();
+                        s.message(message);
+                        drop(s);
+                        if closing {
+                            window.close();
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(previous) = previous {
+                            s.previous = Some(previous);
+                            s.set_busy(false);
+                            s.confirm_label.set_text(&error);
+                            s.confirm_progress.set_fraction(0.0);
+                            s.confirm_keep.set_sensitive(false);
+                            s.confirm_revert.set_label("Retry restore");
+                            s.confirm.present();
+                            s.root.add_css_class("confirmation-pending");
+                        }
+                        s.message(&error);
+                        s.profile_status.set_text(&error);
+                    }
+                }
+            },
+        );
+    }
 
     fn run_with_ui_lock<T, F, S>(e: &Rc<RefCell<Self>>, lock_ui: bool, action: F, success: S)
     where
@@ -787,6 +894,7 @@ impl Editor {
                     }
                     Err(error) => s.message(&format!("{error:#}")),
                 }
+                s.sync_mirror_state();
             },
         );
     }
@@ -1241,6 +1349,16 @@ impl Editor {
         self.mirror_peer.set_sensitive(!names.is_empty());
         self.update_mirror_actions();
     }
+    fn sync_mirror_state(&mut self) {
+        match self.mirrors.current() {
+            Ok(mirror) => self.mirror_pair = mirror,
+            Err(error) => {
+                self.mirror_pair = None;
+                self.message(&format!("Cannot read active mirror: {error:#}"));
+            }
+        }
+        self.update_mirror_actions();
+    }
     fn update_mirror_actions(&mut self) {
         let running = self.mirror_pair.is_some();
         let selected = self
@@ -1287,8 +1405,11 @@ impl Editor {
         }
         self.mirror_menu.set_visible(!running);
         let multiple = self.outputs.len() > 1;
-        let status = if let Some((a, b)) = &self.mirror_pair {
-            format!("Active · {a} → {b}. Stop this mirror before starting another.")
+        let status = if let Some(pair) = &self.mirror_pair {
+            format!(
+                "Active · {} → {}. Stop this mirror before starting another.",
+                pair.source, pair.target
+            )
         } else if !multiple {
             "Mirroring requires at least two connected displays.".into()
         } else if !active {
@@ -1574,82 +1695,43 @@ impl Editor {
     }
 
     fn apply(e: &Rc<RefCell<Self>>) {
-        let mirrors_running = e.borrow_mut().mirrors.running();
-        let (desired, client, pair) = {
-            let s = e.borrow();
-            (s.layout.clone(), s.client.clone(), s.mirror_pair.clone())
+        let active_mirror = e.borrow_mut().mirrors.current();
+        let pair = match active_mirror {
+            Ok(pair) => pair,
+            Err(error) => {
+                e.borrow()
+                    .message(&format!("Cannot read active mirror: {error:#}"));
+                return;
+            }
+        };
+        let desired = {
+            let mut s = e.borrow_mut();
+            s.mirror_pair = pair.clone();
+            s.layout.clone()
         };
         if !desired.iter().any(|item| item.enabled) {
             e.borrow()
                 .message("At least one display must remain enabled.");
             return;
         }
-        if mirrors_running
-            && pair.as_ref().is_some_and(|p| {
-                desired
-                    .iter()
-                    .any(|item| !item.enabled && (item.name == p.0 || item.name == p.1))
-            })
-        {
+        if pair.as_ref().is_some_and(|p| {
+            desired
+                .iter()
+                .any(|item| !item.enabled && (item.name == p.source || item.name == p.target))
+        }) {
             e.borrow()
                 .message("Stop mirroring before disabling its source or destination.");
             return;
         }
         e.borrow().message("Applying layout…");
-        Self::run(
+        Self::apply_profile_transaction(
             e,
-            move || {
-                let previous = snapshot(&client.outputs()?)?;
-                if let Err(error) = client.apply(&desired) {
-                    if let Err(rollback_error) = client.apply(&previous) {
-                        return Ok(ApplyOutcome::RestoreFailed(
-                            previous,
-                            format!("Apply failed: {error}. Restore failed: {rollback_error}"),
-                        ));
-                    }
-                    bail!("Apply failed; previous layout restored: {error}");
-                }
-                Ok(ApplyOutcome::Applied(previous))
+            Profile {
+                outputs: desired,
+                mirror: pair,
             },
-            |e, outcome| match outcome {
-                ApplyOutcome::Applied(previous) => {
-                    let mut s = e.borrow_mut();
-                    s.previous = Some(previous);
-                    s.remaining = 20;
-                    s.set_busy(false);
-                    s.confirm_label
-                        .set_text("Previous settings restore in 20 seconds");
-                    s.confirm_progress.set_fraction(1.0);
-                    s.confirm_keep.set_sensitive(true);
-                    s.confirm_revert.set_label("Revert now");
-                    s.confirm.present();
-                    s.confirm_revert.grab_focus();
-                    s.root.add_css_class("confirmation-pending");
-                    s.message("Layout applied. Awaiting confirmation.");
-                    drop(s);
-                    let weak = weak(e);
-                    e.borrow_mut().confirm_timer =
-                        Some(glib::timeout_add_seconds_local(1, move || {
-                            if let Some(e) = weak.upgrade() {
-                                Self::tick(&e)
-                            } else {
-                                glib::ControlFlow::Break
-                            }
-                        }));
-                }
-                ApplyOutcome::RestoreFailed(previous, error) => {
-                    let mut s = e.borrow_mut();
-                    s.previous = Some(previous);
-                    s.set_busy(false);
-                    s.confirm_label.set_text(&error);
-                    s.confirm_progress.set_fraction(0.0);
-                    s.confirm_keep.set_sensitive(false);
-                    s.confirm_revert.set_label("Retry restore");
-                    s.confirm.present();
-                    s.root.add_css_class("confirmation-pending");
-                    s.message(&error);
-                }
-            },
+            true,
+            "Layout applied. Awaiting confirmation.",
         );
     }
     fn tick(e: &Rc<RefCell<Self>>) -> glib::ControlFlow {
@@ -1709,7 +1791,7 @@ impl Editor {
         );
     }
     fn revert(e: &Rc<RefCell<Self>>) {
-        let (previous, client) = {
+        let previous = {
             let mut s = e.borrow_mut();
             if s.busy {
                 return;
@@ -1718,44 +1800,10 @@ impl Editor {
                 return;
             };
             s.cancel_timer();
-            s.message("Restoring previous display layout…");
-            (previous, s.client.clone())
+            s.message("Restoring previous display settings and mirror…");
+            previous
         };
-        Self::run(
-            e,
-            {
-                let previous = previous.clone();
-                move || {
-                    client.apply(&previous)?;
-                    Ok(())
-                }
-            },
-            move |e, ()| {
-                let (closing, window) = {
-                    let mut s = e.borrow_mut();
-                    s.previous = None;
-                    s.confirm.set_visible(false);
-                    s.root.remove_css_class("confirmation-pending");
-                    s.editor_area.set_sensitive(true);
-                    let closing = s.closing;
-                    if closing {
-                        if let Some(timer) = s.mirror_timer.take() {
-                            timer.remove();
-                        }
-                    } else {
-                        s.layout = previous.clone();
-                        s.baseline = Some(previous);
-                        s.rebuild();
-                    }
-                    (closing, s.window.clone())
-                };
-                if closing {
-                    window.close();
-                } else {
-                    Self::refresh(e);
-                }
-            },
-        );
+        Self::apply_profile_transaction(e, previous, false, "Previous settings restored.");
     }
 
     fn reload_profiles(e: &Rc<RefCell<Self>>, selected: Option<String>) {
@@ -1801,8 +1849,8 @@ impl Editor {
         );
     }
     fn save_profile(e: &Rc<RefCell<Self>>) {
-        let (name, layout, store) = {
-            let s = e.borrow();
+        let (name, layout, store, mut mirrors) = {
+            let mut s = e.borrow_mut();
             if s.busy || s.previous.is_some() {
                 return;
             }
@@ -1810,22 +1858,44 @@ impl Editor {
                 s.profile_name.text().trim().to_owned(),
                 s.layout.clone(),
                 s.profiles.clone(),
+                std::mem::take(&mut s.mirrors),
             )
         };
         Self::run_with_ui_lock(
             e,
             false,
             move || {
-                store.save(&name, &layout)?;
-                Ok(name)
+                let result = (|| {
+                    let profile = Profile {
+                        outputs: layout,
+                        mirror: mirrors.current()?,
+                    };
+                    profile
+                        .validate()
+                        .map_err(|error| anyhow!("Invalid profile: {error:#}"))?;
+                    store.save(&name, &profile)?;
+                    Ok::<_, anyhow::Error>(name)
+                })();
+                Ok((mirrors, result))
             },
-            |e, name| {
-                e.borrow().profile_name.set_text("");
-                Self::reload_profiles(e, Some(name.clone()));
-                e.borrow()
-                    .profile_status
-                    .set_text(&format!("Saved profile “{name}”."));
-                e.borrow().message(&format!("Saved profile “{name}”."));
+            |e, (mirrors, result)| {
+                e.borrow_mut().mirrors = mirrors;
+                e.borrow_mut().sync_mirror_state();
+                match result {
+                    Ok(name) => {
+                        e.borrow().profile_name.set_text("");
+                        Self::reload_profiles(e, Some(name.clone()));
+                        e.borrow()
+                            .profile_status
+                            .set_text(&format!("Saved profile “{name}”."));
+                        e.borrow().message(&format!("Saved profile “{name}”."));
+                    }
+                    Err(error) => {
+                        let error = format!("{error:#}");
+                        e.borrow().profile_status.set_text(&error);
+                        e.borrow().message(&error);
+                    }
+                }
             },
         );
     }
@@ -1849,17 +1919,26 @@ impl Editor {
         Self::run(
             e,
             move || {
-                let layout = store.load(&name)?;
+                let profile = store.load(&name)?;
                 let outputs = client.outputs()?;
-                Ok((outputs.clone(), merge_profile(&layout, &outputs)?))
+                let profile = merge_profile(&profile, &outputs)?;
+                profile
+                    .validate()
+                    .map_err(|error| anyhow!("Invalid profile: {error:#}"))?;
+                Ok((outputs, profile))
             },
-            |e, (outputs, layout)| {
+            |e, (outputs, profile)| {
                 let mut s = e.borrow_mut();
                 s.outputs = outputs;
-                s.layout = layout;
+                s.layout = profile.outputs.clone();
                 s.rebuild();
                 drop(s);
-                Self::apply(e);
+                Self::apply_profile_transaction(
+                    e,
+                    profile,
+                    true,
+                    "Profile applied. Awaiting confirmation.",
+                );
             },
         );
     }
@@ -2062,15 +2141,14 @@ impl Editor {
                 std::mem::take(&mut s.mirrors),
             )
         };
-        let success_pair = (source.clone(), target.clone());
         let status_text = format!(
             "Mirroring {source} to {target}. Stop the mirror before disabling either display."
         );
+        let target_for_ui = target.clone();
         Self::run(
             e,
             move || {
-                let outputs = client.prepare_mirror(&source, &target);
-                let (outputs, result) = match outputs {
+                let (outputs, result) = match client.prepare_mirror(&source, &target) {
                     Ok(outputs) => (Some(outputs), mirrors.start(&source, &target)),
                     Err(error) => (None, Err(error)),
                 };
@@ -2085,27 +2163,30 @@ impl Editor {
                 s.mirrors = mirrors;
                 if let Some(outputs) = outputs {
                     if let Ok(actual) = snapshot(&outputs) {
-                        if let Some(target) = actual.iter().find(|row| row.name == success_pair.1) {
+                        if let Some(target_row) =
+                            actual.iter().find(|row| row.name == target_for_ui)
+                        {
                             let baseline = s
                                 .baseline
                                 .as_ref()
-                                .and_then(|rows| rows.iter().find(|row| row.name == target.name));
+                                .and_then(|rows| rows.iter().find(|row| row.name == target_for_ui));
                             if baseline.is_some_and(|row| !row.enabled) {
                                 let unchanged =
-                                    s.layout.iter().find(|row| row.name == target.name) == baseline;
+                                    s.layout.iter().find(|row| row.name == target_for_ui)
+                                        == baseline;
                                 if let Some(row) =
-                                    s.layout.iter_mut().find(|row| row.name == target.name)
+                                    s.layout.iter_mut().find(|row| row.name == target_for_ui)
                                 {
                                     if unchanged {
-                                        *row = target.clone();
+                                        *row = target_row.clone();
                                     } else {
                                         row.enabled = true;
                                     }
                                 }
                                 if let Some(row) = s.baseline.as_mut().and_then(|rows| {
-                                    rows.iter_mut().find(|row| row.name == target.name)
+                                    rows.iter_mut().find(|row| row.name == target_for_ui)
                                 }) {
-                                    *row = target.clone();
+                                    *row = target_row.clone();
                                 }
                             }
                         }
@@ -2115,11 +2196,13 @@ impl Editor {
                 }
                 match result {
                     Ok(()) => {
-                        s.mirror_pair = Some(success_pair.clone());
-                        s.update_mirror_actions();
+                        s.sync_mirror_state();
                         s.message(&status_text);
                     }
-                    Err(error) => s.message(&error),
+                    Err(error) => {
+                        s.sync_mirror_state();
+                        s.message(&error);
+                    }
                 }
             },
         );
@@ -2141,12 +2224,9 @@ impl Editor {
             |e, (mirrors, result)| {
                 let mut s = e.borrow_mut();
                 s.mirrors = mirrors;
+                s.sync_mirror_state();
                 match result {
-                    Ok(()) => {
-                        s.mirror_pair = None;
-                        s.update_mirror_actions();
-                        s.message("Mirror stopped.");
-                    }
+                    Ok(()) => s.message("Mirror stopped."),
                     Err(error) => s.message(&error),
                 }
             },
@@ -2158,12 +2238,14 @@ impl Editor {
             return glib::ControlFlow::Continue;
         }
         let error = s.mirrors.poll_error();
-        if s.mirror_pair.is_some() && !s.mirrors.running() {
-            s.mirror_pair = None;
-            s.update_mirror_actions();
-            if error.is_none() {
-                s.message("Mirror ended.");
-            }
+        let before = s.mirror_pair.clone();
+        s.sync_mirror_state();
+        if before != s.mirror_pair && error.is_none() {
+            s.message(if s.mirror_pair.is_some() {
+                "Mirror started in another window."
+            } else {
+                "Mirror ended."
+            });
         }
         if let Some(error) = error {
             s.message(&error);
@@ -2274,10 +2356,6 @@ impl Editor {
             return glib::Propagation::Stop;
         }
         let chooser = s.file_chooser.take();
-        let mut mirrors = std::mem::take(&mut s.mirrors);
-        thread::spawn(move || {
-            let _ = mirrors.stop();
-        });
         if let Some(chooser) = chooser {
             glib::idle_add_local_once(move || chooser.cancel());
         }

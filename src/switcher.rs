@@ -1,6 +1,7 @@
-use crate::backend::{snapshot, Layout, NiriClient};
+use crate::backend::NiriClient;
 use crate::daemon::LayoutMemory;
-use crate::services::{merge_profile, ProfileStore};
+use crate::mirror::MirrorManager;
+use crate::services::{merge_profile, Profile, ProfileStore};
 use anyhow::Result;
 use glib::translate::IntoGlib;
 use gtk::{gdk, glib, prelude::*};
@@ -17,7 +18,7 @@ struct State {
     busy: bool,
     closing: bool,
     destroyed: bool,
-    previous: Option<Layout>,
+    previous: Option<Profile>,
 }
 
 struct Picker {
@@ -248,30 +249,47 @@ impl Picker {
             return;
         }
         self.message(&format!("Applying {name}…"));
-        self.run(move || {
-            let client = NiriClient;
-            let outputs = client.outputs()?;
-            let previous = snapshot(&outputs)?;
-            let desired = merge_profile(&ProfileStore::default().load(&name)?, &outputs)?;
-            if let Err(error) = client.apply(&desired) {
-                return Ok(match client.apply(&previous) {
-                    Ok(()) => (None, Some(format!("Apply failed; previous layout restored: {error:#}"))),
-                    Err(restore) => (Some(previous), Some(format!("Apply failed: {error:#}. Restore failed: {restore:#}"))),
-                });
-            }
-            if let Err(error) = LayoutMemory::default().remember(&desired) {
-                return Ok((None, Some(format!("Profile applied, but automatic restore could not remember it: {error:#}"))));
-            }
-            Ok((None, None))
-        }, |this, (previous, error)| {
-            this.state.borrow_mut().previous = previous;
-            if let Some(error) = error {
-                this.message(&error);
-                this.finish_close();
-            } else {
-                this.window.destroy();
-            }
-        });
+        self.run(
+            move || {
+                let client = NiriClient;
+                let outputs = client.outputs()?;
+                let mut mirrors = MirrorManager::default();
+                let previous = Profile::capture(&client, &mut mirrors)?;
+                let desired = merge_profile(&ProfileStore::default().load(&name)?, &outputs)?;
+                if let Err(error) = desired.apply(&client, &mut mirrors) {
+                    return Ok(match previous.apply(&client, &mut mirrors) {
+                        Ok(()) => (
+                            None,
+                            Some(format!("Apply failed; previous layout restored: {error:#}")),
+                        ),
+                        Err(restore) => (
+                            Some(previous),
+                            Some(format!(
+                                "Apply failed: {error:#}. Restore failed: {restore:#}"
+                            )),
+                        ),
+                    });
+                }
+                if let Err(error) = LayoutMemory::default().remember(&desired.outputs) {
+                    return Ok((
+                        None,
+                        Some(format!(
+                        "Profile applied, but automatic restore could not remember it: {error:#}"
+                    )),
+                    ));
+                }
+                Ok((None, None))
+            },
+            |this, (previous, error)| {
+                this.state.borrow_mut().previous = previous;
+                if let Some(error) = error {
+                    this.message(&error);
+                    this.finish_close();
+                } else {
+                    this.window.destroy();
+                }
+            },
+        );
     }
 
     fn restore(self: &Rc<Self>) {
@@ -282,10 +300,13 @@ impl Picker {
             return;
         };
         self.run(
-            move || NiriClient.apply(&previous),
+            move || {
+                let mut mirrors = MirrorManager::default();
+                previous.apply(&NiriClient, &mut mirrors)
+            },
             |this, ()| {
                 this.state.borrow_mut().previous = None;
-                this.message("Previous display layout restored.");
+                this.message("Previous display profile restored.");
                 this.finish_close();
             },
         );

@@ -408,6 +408,16 @@ impl NiriClient {
         if enabled_count == 0 {
             bail!("At least one output must remain enabled");
         }
+        let disabled: Vec<&str> = layout
+            .iter()
+            .filter(|row| !row.enabled)
+            .map(|row| row.name.as_str())
+            .collect();
+        let focus = if disabled.is_empty() {
+            None
+        } else {
+            self.focused_workspace_id().unwrap_or(None)
+        };
         for row in layout.iter().filter(|row| row.enabled) {
             self.command(&["output", &row.name, "on"])?;
             if let Some(mode) = &row.mode {
@@ -448,10 +458,116 @@ impl NiriClient {
                 &row.y.to_string(),
             ])?;
         }
-        for row in layout.iter().filter(|row| !row.enabled) {
-            self.command(&["output", &row.name, "off"])?;
+        for name in &disabled {
+            self.command(&["output", name, "off"])?;
+        }
+        if let Some(id) = focus {
+            // Niri acknowledges an output change before applying it, and keeps
+            // the remaining output's active workspace when an output
+            // disappears. That is often its empty trailing workspace, so wait
+            // for the workspace move and return to the workspace the user was
+            // on before it happened.
+            self.wait_until_disabled(&disabled);
+            let _ = self.focus_workspace_id(id);
         }
         Ok(())
+    }
+    pub fn apply_with_source(&self, layout: &[OutputConfig], source: &str) -> Result<()> {
+        let source_row = layout
+            .iter()
+            .find(|row| row.name == source)
+            .ok_or_else(|| anyhow!("Layout must include the mirror source {source}"))?;
+        if !source_row.enabled {
+            bail!("Mirror source {source} must be enabled in the layout.");
+        }
+        let outputs = self.outputs()?;
+        let active = outputs
+            .get(source)
+            .is_some_and(|output| output.get("logical").is_some_and(|value| !value.is_null()));
+        if active {
+            return self.apply(layout);
+        }
+        // Niri moves workspaces off outputs as they disappear. Enable the source
+        // alone first so it receives the workspaces; apply() then returns focus
+        // to the moved workspace before the destination is enabled, which
+        // leaves it in place for mirroring.
+        let focus = self.focused_workspace_id().unwrap_or(None);
+        let isolated: Layout = layout
+            .iter()
+            .map(|row| OutputConfig {
+                enabled: row.name == source,
+                ..row.clone()
+            })
+            .collect();
+        self.apply(&isolated)?;
+        self.apply(layout)?;
+        // Enabling the destination can move named workspaces again, so make
+        // sure focus ends up back where it was before the switch.
+        if let Some(id) = focus {
+            let _ = self.focus_workspace_id(id);
+        }
+        Ok(())
+    }
+    fn wait_until_disabled(&self, names: &[&str]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let Ok(outputs) = self.outputs() else {
+                return;
+            };
+            let pending = names.iter().any(|name| {
+                outputs
+                    .get(*name)
+                    .is_some_and(|output| output.get("logical").is_some_and(|v| !v.is_null()))
+            });
+            if !pending {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn workspaces(&self) -> Result<Vec<Value>> {
+        let text = self.run(&["--json", "workspaces"])?;
+        let workspaces: Value =
+            serde_json::from_str(&text).context("Niri returned invalid workspaces JSON")?;
+        workspaces
+            .as_array()
+            .cloned()
+            .ok_or_else(|| anyhow!("Niri workspaces response was not a JSON array"))
+    }
+    pub(crate) fn focused_workspace_id(&self) -> Result<Option<i64>> {
+        Ok(self
+            .workspaces()?
+            .iter()
+            .find(|workspace| workspace.get("is_focused") == Some(&Value::Bool(true)))
+            .and_then(|workspace| workspace.get("id"))
+            .and_then(Value::as_i64))
+    }
+    pub(crate) fn focus_workspace_id(&self, id: i64) -> Result<()> {
+        let workspaces = self.workspaces()?;
+        let Some(workspace) = workspaces
+            .iter()
+            .find(|workspace| workspace.get("id").and_then(Value::as_i64) == Some(id))
+        else {
+            return Ok(());
+        };
+        if workspace.get("is_focused") == Some(&Value::Bool(true)) {
+            return Ok(());
+        }
+        let idx = workspace
+            .get("idx")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("Niri reported invalid workspace index"))?;
+        // The index is resolved against the focused output, so focus the
+        // workspace's output first when niri picked a different one.
+        if let Some(output) = workspace.get("output").and_then(Value::as_str) {
+            let focused = self.run(&["--json", "focused-output"])?;
+            let focused: Value =
+                serde_json::from_str(&focused).context("Niri returned invalid focused output")?;
+            if focused.get("name").and_then(Value::as_str) != Some(output) {
+                self.command(&["action", "focus-monitor", output])?;
+            }
+        }
+        self.command(&["action", "focus-workspace", &idx.to_string()])
     }
     fn command(&self, args: &[&str]) -> Result<()> {
         let rendered = args.join(" ");
