@@ -1,6 +1,7 @@
 use crate::backend::NiriClient;
 use crate::daemon::LayoutMemory;
 use crate::mirror::MirrorManager;
+use crate::profile_sync;
 use crate::services::{merge_profile, Profile, ProfileStore};
 use anyhow::Result;
 use glib::translate::IntoGlib;
@@ -61,7 +62,11 @@ impl Picker {
         if !self.list.is_sensitive() || !self.list.is_mapped() {
             return;
         }
-        if let Some(row) = self.list.selected_row().or_else(|| self.list.row_at_index(0)) {
+        if let Some(row) = self
+            .list
+            .selected_row()
+            .or_else(|| self.list.row_at_index(0))
+        {
             row.grab_focus();
         }
         if !self.list.has_focus() {
@@ -279,12 +284,14 @@ impl Picker {
                         Ok(()) => (
                             None,
                             Some(format!("Apply failed; previous layout restored: {error:#}")),
+                            false,
                         ),
                         Err(restore) => (
                             Some(previous),
                             Some(format!(
                                 "Apply failed: {error:#}. Restore failed: {restore:#}"
                             )),
+                            false,
                         ),
                     });
                 }
@@ -294,12 +301,16 @@ impl Picker {
                         Some(format!(
                         "Profile applied, but automatic restore could not remember it: {error:#}"
                     )),
+                        true,
                     ));
                 }
-                Ok((None, None))
+                Ok((None, None, true))
             },
-            |this, (previous, error)| {
+            |this, (previous, error, switched)| {
                 this.state.borrow_mut().previous = previous;
+                if switched {
+                    profile_sync::notify_switched();
+                }
                 if let Some(error) = error {
                     this.message(&error);
                     this.finish_close();

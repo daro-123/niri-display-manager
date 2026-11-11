@@ -1,10 +1,12 @@
 use crate::backend::{dimensions, snapshot, Layout, NiriClient, OutputConfig, Outputs};
 use crate::daemon::{self, LayoutMemory};
 use crate::mirror::{MirrorConfig, MirrorManager};
+use crate::profile_sync;
 use crate::services::{merge_profile, ConfigStore, Profile, ProfileStore};
 use anyhow::{anyhow, bail, Result};
 use gtk::cairo;
 use gtk::gdk;
+use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow};
@@ -99,6 +101,8 @@ struct Editor {
     confirm_keep: gtk::Button,
     confirm_revert: gtk::Button,
     updating: Rc<Cell<bool>>,
+    _profile_sync: Option<gio::SignalSubscription>,
+    sync_pending: bool,
 }
 
 thread_local! {
@@ -110,6 +114,13 @@ fn weak(editor: &Rc<RefCell<Editor>>) -> Weak<RefCell<Editor>> {
 
 pub fn present(app: &Application) {
     let editor = Editor::new(app);
+    let weak = Rc::downgrade(&editor);
+    let subscription = profile_sync::on_switched(move || {
+        if let Some(editor) = weak.upgrade() {
+            Editor::synchronize(&editor);
+        }
+    });
+    editor.borrow_mut()._profile_sync = subscription;
     OPEN_EDITORS.with(|editors| editors.borrow_mut().push(Rc::clone(&editor)));
     editor.borrow().window.present();
     Editor::refresh(&editor);
@@ -429,6 +440,8 @@ impl Editor {
             confirm_keep,
             confirm_revert,
             updating: Rc::new(Cell::new(false)),
+            _profile_sync: None,
+            sync_pending: false,
         }));
         editor.borrow_mut().owner = Rc::downgrade(&editor);
         Self::connect(
@@ -842,6 +855,7 @@ impl Editor {
                         }
                     }
                     e.borrow_mut().update_dirty();
+                    Self::flush_pending_sync(&e);
                 }
                 glib::ControlFlow::Break
             }
@@ -853,6 +867,8 @@ impl Editor {
                     s.set_busy(false);
                     s.message("Display operation ended unexpectedly.");
                     s.update_dirty();
+                    drop(s);
+                    Self::flush_pending_sync(&e);
                 }
                 glib::ControlFlow::Break
             }
@@ -871,12 +887,15 @@ impl Editor {
         self.status.set_text(text);
     }
     fn refresh(e: &Rc<RefCell<Self>>) {
+        Self::refresh_with(e, "All changes applied.");
+    }
+    fn refresh_with(e: &Rc<RefCell<Self>>, applied: &'static str) {
         e.borrow().message("Reading connected displays…");
         let client = e.borrow().client.clone();
         Self::run(
             e,
             move || Ok((client.outputs()?, daemon::enabled().ok())),
-            |e, (outputs, daemon_active)| {
+            move |e, (outputs, daemon_active)| {
                 let mut s = e.borrow_mut();
                 s.outputs = outputs;
                 if let Some(active) = daemon_active {
@@ -890,13 +909,45 @@ impl Editor {
                         s.layout = layout.clone();
                         s.baseline = Some(layout);
                         s.rebuild();
-                        s.message("All changes applied.");
+                        s.message(applied);
                     }
                     Err(error) => s.message(&format!("{error:#}")),
                 }
                 s.sync_mirror_state();
             },
         );
+    }
+    fn flush_pending_sync(e: &Rc<RefCell<Self>>) {
+        let pending = {
+            let mut s = e.borrow_mut();
+            std::mem::take(&mut s.sync_pending)
+        };
+        if pending {
+            Self::synchronize(e);
+        }
+    }
+    fn synchronize(e: &Rc<RefCell<Self>>) {
+        {
+            let mut s = e.borrow_mut();
+            if s.closing {
+                return;
+            }
+            if s.busy {
+                s.sync_pending = true;
+                return;
+            }
+            if s.previous.is_some() {
+                // A picker switch supersedes this editor's pending confirmation.
+                s.cancel_timer();
+                s.previous = None;
+                s.confirm.set_visible(false);
+                s.root.remove_css_class("confirmation-pending");
+                s.editor_area.set_sensitive(true);
+                s.toolbar.set_sensitive(true);
+                s.layout_actions.set_sensitive(true);
+            }
+        }
+        Self::refresh_with(e, "Display layout synchronized to the profile switch.");
     }
 
     fn update_dirty(&mut self) {
