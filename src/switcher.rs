@@ -40,15 +40,33 @@ impl Picker {
 
     fn update_controls(&self) {
         let state = self.state.borrow();
-        self.list
-            .set_sensitive(!state.busy && state.previous.is_none());
+        let enabled = !state.busy && state.previous.is_none();
+        self.list.set_sensitive(enabled);
         self.retry.set_visible(state.previous.is_some());
         self.retry.set_sensitive(!state.busy);
+        drop(state);
+        if enabled {
+            // The list starts insensitive while profiles load; restore keyboard
+            // focus once it accepts input so arrow keys navigate the rows.
+            self.focus_selected();
+        }
     }
 
     fn clear_indicator(&self) {
         self.drop_position.set(None);
         self.indicator.queue_draw();
+    }
+
+    fn focus_selected(&self) {
+        if !self.list.is_sensitive() || !self.list.is_mapped() {
+            return;
+        }
+        if let Some(row) = self.list.selected_row().or_else(|| self.list.row_at_index(0)) {
+            row.grab_focus();
+        }
+        if !self.list.has_focus() {
+            self.list.grab_focus();
+        }
     }
 
     fn run<T: Send + 'static>(
@@ -218,7 +236,7 @@ impl Picker {
             self.list.append(&row);
             if selected == Some(name.as_str()) || (selected.is_none() && index == 0) {
                 self.list.select_row(Some(&row));
-                row.grab_focus();
+                self.focus_selected();
             }
         }
     }
@@ -427,6 +445,12 @@ pub fn present(app: &gtk::Application, editor_renderer: Option<OsString>) {
         retry,
         state: RefCell::new(State::default()),
         editor_renderer,
+    });
+    let weak = Rc::downgrade(&this);
+    this.list.connect_map(move |_| {
+        if let Some(this) = weak.upgrade() {
+            this.focus_selected();
+        }
     });
     let weak = Rc::downgrade(&this);
     this.indicator.set_draw_func(move |_, cr, width, height| {
