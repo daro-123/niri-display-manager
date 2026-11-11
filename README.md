@@ -40,11 +40,23 @@ Changes remain staged until **Apply changes**. Choose **Keep changes** within 20
 
 Mirroring starts immediately, independently of staged display changes. Settings choose whether the selected display is the source or destination. Stop mirroring before disabling either display. Closing the editor stops its mirror process.
 
-## Named profiles
+## Profiles
 
-Open **Profiles** in the editor. Enter a new name and choose **Save current edits** to save monitor settings, including unapplied edits. Existing names cannot be overwritten; delete a profile before reusing its name.
+Open **Profiles** in the editor. Enter a new name and choose **Save current edits** to save monitor settings, including unapplied edits and active mirrors. Existing names cannot be overwritten; delete a named profile before reusing its name.
 
-Select a saved profile and choose **Apply profile** to switch layouts with the editor's 20-second confirmation. Choose **Delete** and confirm to remove a profile without changing displays.
+Select a named or predefined profile and choose **Apply profile** to switch layouts with the editor's 20-second confirmation. **Delete** is available only for named profiles and asks for confirmation.
+
+### Predefined profiles
+
+Open **Settings → Predefined profiles** to configure:
+
+- **Build-in**: enables built-in displays and disables every connected external display. Works without an external display.
+- **External**: disables built-in displays and enables every connected external display, arranged side by side.
+- **Mirror build-in**: mirrors the built-in display to every connected external display. Requires `wl-mirror`.
+- **Horizontal**: enables built-in and external displays side by side, with the built-in group on the left or right.
+- **Vertical**: enables built-in and external displays in a vertical stack, with the built-in group above or below.
+
+### Compact picker
 
 Launch the compact profile picker:
 
@@ -58,11 +70,11 @@ Press **1–9** to apply the corresponding numbered profile immediately and clos
 
 Escape closes the picker without switching. If a switch is already running, it finishes before the picker closes. Press **E** to open the full editor and close the picker.
 
-Drag anywhere on a profile row onto the upper or lower half of another row to place it before or after that profile. One shared line marks the insertion boundary between rows. The order persists across launches and also applies to the editor's profile list. Shortcuts follow the current order; newly created profiles appear after the saved order.
+Drag anywhere on a profile row onto the upper or lower half of another row to place it before or after that profile. One shared line marks the insertion boundary between rows. Named profiles and visible presets share persistent ordering and shortcuts. The order also applies to the editor's profile list; hiding a preset preserves its saved position. Newly created profiles appear after the saved order.
 
 The picker fits its height to the list, scrolling when the list exceeds 420 pixels. It defaults to Cairo rendering to avoid GPU initialization overhead. An explicit `GSK_RENDERER` takes precedence. Opening the editor preserves the original renderer environment.
 
-Profiles live under `$XDG_CONFIG_HOME/niri-display/profiles` (default `~/.config/niri-display/profiles`), separately from automatic daemon layouts. They store connector names, enabled state, mode, scale, position, and rotation, not mirroring. All monitors saved in a profile must be connected before applying it. Additional connected monitors keep their current settings.
+Profiles live under `$XDG_CONFIG_HOME/niri-display/profiles` (default `~/.config/niri-display/profiles`), separately from automatic daemon layouts. Named profiles store connector names, enabled state, mode, scale, position, rotation, and active mirrors. All monitors saved in a named current-settings profile must be connected before applying it. Additional connected monitors keep their current settings. Preset settings and visibility are stored in `.predefined.json`, and shared ordering in `.order.json`. Existing layout-list, single-mirror, and previously saved dynamic profiles remain readable.
 
 ## Optional background daemon
 
@@ -113,7 +125,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --check
 ```
 
-The 11 regression tests cover safe compositor mutation order, strict configuration boundaries, legacy profile and layout compatibility, daemon connector transitions, and fractional-scale geometry. Tests run compositor commands against an isolated executable and do not change the running desktop.
+Regression tests cover safe compositor mutation order, strict configuration boundaries, legacy profile and layout compatibility, port-independent profile resolution, saved per-role settings, preset visibility and ordering, daemon connector transitions, and fractional-scale geometry. Tests run compositor commands against an isolated executable and do not change the running desktop.
 
 ## Desktop diagnostics
 

@@ -1,6 +1,9 @@
 use niri_display::backend::{dimensions, snapshot, Layout, NiriClient, OutputConfig, Outputs};
 use niri_display::daemon::{LayoutMemory, RestoreDaemon};
-use niri_display::services::{merge_profile, ConfigStore, Profile, ProfileStore};
+use niri_display::services::{
+    merge_profile, ConfigStore, DisplaySettings, PresetKind, PresetSettings, Profile, ProfileId,
+    ProfileMode, ProfileStore,
+};
 use serde_json::{json, Value};
 use std::{fs, path::Path, process::Command};
 
@@ -174,7 +177,8 @@ fn profiles_preserve_unicode_names_order_and_no_overwrite() {
     let store = ProfileStore::new(temp.path().into());
     let original = Profile {
         outputs: layout(),
-        mirror: None,
+        mirrors: Vec::new(),
+        mode: ProfileMode::Exact,
     };
     fs::write(
         temp.path().join("RGVzayAvIPCflqU=.json"),
@@ -200,16 +204,498 @@ fn profiles_preserve_unicode_names_order_and_no_overwrite() {
 fn profile_merge_keeps_extra_monitors_and_rejects_missing_saved_monitors() {
     let rows = Profile {
         outputs: snapshot(&outputs(&[("DP-1", true, "Normal")])).unwrap(),
-        mirror: None,
+        mirrors: Vec::new(),
+        mode: ProfileMode::Exact,
     };
     let current = outputs(&[("DP-1", true, "Normal"), ("DP-2", true, "Normal")]);
     let merged = merge_profile(&rows, &current).unwrap();
     assert_eq!(merged.outputs[1], snapshot(&current).unwrap()[1]);
     let saved = Profile {
         outputs: layout(),
-        mirror: None,
+        mirrors: Vec::new(),
+        mode: ProfileMode::Exact,
     };
     assert!(merge_profile(&saved, &outputs(&[("DP-1", true, "Normal")])).is_err());
+}
+#[test]
+fn dynamic_profiles_resolve_all_current_externals_and_round_trip() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ProfileStore::new(temp.path().into());
+    let saved = outputs(&[("eDP-1", true, "Normal"), ("HDMI-1", false, "Normal")]);
+    for (name, mode) in [
+        ("external", ProfileMode::ExternalOnly),
+        ("mirror", ProfileMode::MirrorBuiltIn),
+    ] {
+        let profile = Profile {
+            outputs: snapshot(&saved).unwrap(),
+            mirrors: Vec::new(),
+            mode,
+        };
+        store.save(name, &profile).unwrap();
+        assert_eq!(store.load(name).unwrap(), profile);
+        let current = outputs(&[
+            ("eDP-1", true, "Normal"),
+            ("DP-1", false, "Normal"),
+            ("DP-2", false, "Normal"),
+        ]);
+        let resolved = merge_profile(&store.load(name).unwrap(), &current).unwrap();
+        assert_eq!(resolved.mode, ProfileMode::Exact);
+        assert!(resolved
+            .outputs
+            .iter()
+            .filter(|r| r.name.starts_with("DP-"))
+            .all(|r| r.enabled));
+        assert_eq!(
+            resolved.mirrors.len(),
+            if mode == ProfileMode::MirrorBuiltIn {
+                2
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            resolved
+                .outputs
+                .iter()
+                .find(|r| r.name == "DP-1")
+                .unwrap()
+                .mode
+                .as_deref(),
+            Some("1920x1080@60")
+        );
+    }
+}
+
+#[test]
+fn profile_loader_accepts_legacy_mirror_and_rejects_unknown_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ProfileStore::new(temp.path().into());
+    let profile = Profile {
+        outputs: snapshot(&outputs(&[
+            ("DP-1", true, "Normal"),
+            ("DP-2", true, "Normal"),
+        ]))
+        .unwrap(),
+        mirrors: Vec::new(),
+        mode: ProfileMode::Exact,
+    };
+    let name = "legacy";
+    let path = temp.path().join("bGVnYWN5.json");
+    fs::write(
+        &path,
+        json!({"outputs": profile.outputs, "mirror": {"source":"DP-1","target":"DP-2"}})
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(store.load(name).unwrap().mirrors.len(), 1);
+    fs::write(
+        &path,
+        json!({"outputs": profile.outputs, "mode":"future"}).to_string(),
+    )
+    .unwrap();
+    assert!(store.load(name).is_err());
+}
+
+#[test]
+fn dynamic_profiles_fail_when_required_external_or_builtin_missing() {
+    for (mode, current) in [
+        (
+            ProfileMode::ExternalOnly,
+            outputs(&[("DP-1", true, "Normal")]),
+        ),
+        (
+            ProfileMode::ExternalOnly,
+            outputs(&[("eDP-1", true, "Normal")]),
+        ),
+        (
+            ProfileMode::MirrorBuiltIn,
+            outputs(&[("DP-1", true, "Normal")]),
+        ),
+    ] {
+        let profile = Profile {
+            outputs: layout(),
+            mirrors: Vec::new(),
+            mode,
+        };
+        assert!(merge_profile(&profile, &current).is_err());
+    }
+}
+
+#[test]
+fn profile_validation_rejects_duplicate_mirror_targets() {
+    let profile = Profile {
+        outputs: snapshot(&outputs(&[
+            ("DP-1", true, "Normal"),
+            ("DP-2", true, "Normal"),
+            ("DP-3", true, "Normal"),
+        ]))
+        .unwrap(),
+        mirrors: vec![
+            niri_display::mirror::MirrorConfig {
+                source: "DP-1".into(),
+                target: "DP-2".into(),
+            },
+            niri_display::mirror::MirrorConfig {
+                source: "DP-1".into(),
+                target: "DP-2".into(),
+            },
+        ],
+        mode: ProfileMode::Exact,
+    };
+    assert!(profile.validate().is_err());
+}
+
+#[test]
+fn predefined_profiles_preserve_role_settings_across_ports() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ProfileStore::new(temp.path().into());
+    store
+        .save_preset(
+            PresetKind::MirrorBuiltIn,
+            &PresetSettings {
+                show_in_picker: true,
+                built_in: DisplaySettings {
+                    resolution: Some("2560x1440".into()),
+                    scale: 1.5,
+                },
+                external: DisplaySettings {
+                    resolution: Some("1920x1080".into()),
+                    scale: 1.0,
+                },
+                ..PresetSettings::default()
+            },
+        )
+        .unwrap();
+    let store = ProfileStore::new(temp.path().into());
+    for port in ["HDMI-A-1", "DP-3"] {
+        let mut current = outputs(&[("eDP-1", false, "Normal"), (port, false, "Normal")]);
+        current["eDP-1"]["modes"] = json!([
+            {"width":1920,"height":1080,"refresh_rate":60000},
+            {"width":2560,"height":1440,"refresh_rate":59998}
+        ]);
+        let resolved = store
+            .resolve(
+                &ProfileId::Predefined {
+                    preset: PresetKind::MirrorBuiltIn,
+                },
+                &current,
+            )
+            .unwrap();
+        let built_in = resolved
+            .outputs
+            .iter()
+            .find(|row| row.name == "eDP-1")
+            .unwrap();
+        let external = resolved
+            .outputs
+            .iter()
+            .find(|row| row.name == port)
+            .unwrap();
+        assert!(built_in.enabled && external.enabled);
+        assert_eq!(built_in.scale, 1.5);
+        assert_eq!(built_in.mode.as_deref(), Some("2560x1440@59.998"));
+        assert_eq!(external.scale, 1.0);
+        assert_eq!(external.mode.as_deref(), Some("1920x1080@60"));
+        assert_eq!(external.x, 1707);
+        assert_eq!(
+            resolved.mirrors,
+            vec![niri_display::mirror::MirrorConfig {
+                source: "eDP-1".into(),
+                target: port.into()
+            }]
+        );
+        current[port]["modes"] = json!([{"width":1280,"height":720,"refresh_rate":60000}]);
+        assert!(store
+            .resolve(
+                &ProfileId::Predefined {
+                    preset: PresetKind::MirrorBuiltIn
+                },
+                &current
+            )
+            .is_err());
+    }
+    store
+        .save_preset(
+            PresetKind::ExternalOnly,
+            &PresetSettings {
+                external: DisplaySettings {
+                    resolution: None,
+                    scale: 1.0,
+                },
+                ..PresetSettings::default()
+            },
+        )
+        .unwrap();
+    let mut current = outputs(&[
+        ("eDP-1", true, "Normal"),
+        ("DP-1", false, "Normal"),
+        ("DP-2", false, "Normal"),
+    ]);
+    current["DP-1"]["modes"] = json!([
+        {"width":1920,"height":1080,"refresh_rate":60000},
+        {"width":3840,"height":2160,"refresh_rate":60000,"is_preferred":true}
+    ]);
+    let resolved = store
+        .resolve(
+            &ProfileId::Predefined {
+                preset: PresetKind::ExternalOnly,
+            },
+            &current,
+        )
+        .unwrap();
+    assert!(
+        !resolved
+            .outputs
+            .iter()
+            .find(|row| row.name == "eDP-1")
+            .unwrap()
+            .enabled
+    );
+    let first = resolved
+        .outputs
+        .iter()
+        .find(|row| row.name == "DP-1")
+        .unwrap();
+    let second = resolved
+        .outputs
+        .iter()
+        .find(|row| row.name == "DP-2")
+        .unwrap();
+    assert_eq!(first.mode.as_deref(), Some("3840x2160@60"));
+    assert_eq!(second.mode.as_deref(), Some("1920x1080@60"));
+    assert_eq!((first.x, second.x), (0, 3840));
+    assert!(resolved.mirrors.is_empty());
+    // Older settings files have no built-in or arrangement presets or fields.
+    let mut stored: Value =
+        serde_json::from_slice(&fs::read(temp.path().join(".predefined.json")).unwrap()).unwrap();
+    stored.as_object_mut().unwrap().remove("built_in");
+    stored.as_object_mut().unwrap().remove("horizontal");
+    stored.as_object_mut().unwrap().remove("vertical");
+    for preset in stored.as_object_mut().unwrap().values_mut() {
+        preset.as_object_mut().unwrap().remove("built_in_position");
+        preset.as_object_mut().unwrap().remove("alignment");
+    }
+    fs::write(
+        temp.path().join(".predefined.json"),
+        serde_json::to_vec(&stored).unwrap(),
+    )
+    .unwrap();
+    let mut settings = store.preset_settings(PresetKind::BuiltIn).unwrap();
+    settings.built_in.scale = 1.5;
+    settings.built_in.resolution = Some("1920x1080".into());
+    store.save_preset(PresetKind::BuiltIn, &settings).unwrap();
+    let store = ProfileStore::new(temp.path().into());
+    let builtin = ProfileId::Predefined {
+        preset: PresetKind::BuiltIn,
+    };
+    for current in [
+        outputs(&[("eDP-1", false, "Normal")]),
+        outputs(&[("eDP-1", false, "Normal"), ("DP-3", true, "Normal")]),
+    ] {
+        let resolved = store.resolve(&builtin, &current).unwrap();
+        let panel = resolved
+            .outputs
+            .iter()
+            .find(|row| row.name == "eDP-1")
+            .unwrap();
+        assert!(panel.enabled);
+        assert_eq!((panel.x, panel.y, panel.scale), (0, 0, 1.5));
+        assert_eq!(panel.mode.as_deref(), Some("1920x1080@60"));
+        assert!(resolved
+            .outputs
+            .iter()
+            .filter(|row| row.name != "eDP-1")
+            .all(|row| !row.enabled));
+        assert!(resolved.mirrors.is_empty());
+    }
+    assert!(store
+        .resolve(&builtin, &outputs(&[("DP-1", true, "Normal")]))
+        .is_err());
+}
+
+#[test]
+fn predefined_visibility_and_order_do_not_collide_with_named_profiles() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ProfileStore::new(temp.path().into());
+    let named = ProfileId::Named("External".into());
+    store
+        .save(
+            named.name(),
+            &Profile {
+                outputs: layout(),
+                mirrors: vec![],
+                mode: ProfileMode::Exact,
+            },
+        )
+        .unwrap();
+    let external = ProfileId::Predefined {
+        preset: PresetKind::ExternalOnly,
+    };
+    let mirror = ProfileId::Predefined {
+        preset: PresetKind::MirrorBuiltIn,
+    };
+    for kind in [PresetKind::ExternalOnly, PresetKind::MirrorBuiltIn] {
+        store
+            .save_preset(
+                kind,
+                &PresetSettings {
+                    show_in_picker: true,
+                    ..PresetSettings::default()
+                },
+            )
+            .unwrap();
+    }
+    store
+        .save_order(&[mirror.clone(), named.clone(), external.clone()])
+        .unwrap();
+    let mut settings = store.preset_settings(PresetKind::MirrorBuiltIn).unwrap();
+    settings.show_in_picker = false;
+    store
+        .save_preset(PresetKind::MirrorBuiltIn, &settings)
+        .unwrap();
+    assert_eq!(
+        store.list_profiles(true).unwrap(),
+        vec![named.clone(), external.clone()]
+    );
+    assert_eq!(
+        store.list_profiles(false).unwrap(),
+        vec![
+            mirror.clone(),
+            named.clone(),
+            external.clone(),
+            ProfileId::Predefined {
+                preset: PresetKind::BuiltIn,
+            },
+            ProfileId::Predefined {
+                preset: PresetKind::Horizontal,
+            },
+            ProfileId::Predefined {
+                preset: PresetKind::Vertical,
+            },
+        ]
+    );
+    store
+        .save_order(&[external.clone(), named.clone()])
+        .unwrap();
+    assert!(store
+        .save_order(&[mirror.clone(), named.clone(), external.clone()])
+        .is_err());
+    settings.show_in_picker = true;
+    store
+        .save_preset(PresetKind::MirrorBuiltIn, &settings)
+        .unwrap();
+    assert_eq!(
+        store.list_profiles(true).unwrap(),
+        vec![mirror, external, named]
+    );
+    let valid = store.preset_settings(PresetKind::ExternalOnly).unwrap();
+    let mut invalid = valid.clone();
+    invalid.external.scale = 0.0;
+    assert!(store
+        .save_preset(PresetKind::ExternalOnly, &invalid)
+        .is_err());
+    assert_eq!(
+        store.preset_settings(PresetKind::ExternalOnly).unwrap(),
+        valid
+    );
+}
+
+#[test]
+fn arrangement_presets_position_scaled_displays_and_keep_independent_settings() {
+    use niri_display::services::{Alignment, BuiltInPosition};
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = ProfileStore::new(temp.path().into());
+    let mut current = outputs(&[
+        ("eDP-1", false, "Normal"),
+        ("DP-1", true, "Flipped90"),
+        ("DP-2", false, "Normal"),
+    ]);
+    current["eDP-1"]["modes"] = json!([{"width":2560,"height":1440,"refresh_rate":60000}]);
+    current["DP-2"]["modes"] = json!([{"width":1280,"height":720,"refresh_rate":60000}]);
+    for (kind, position, alignment, expected) in [
+        (
+            PresetKind::Horizontal,
+            BuiltInPosition::Before,
+            Alignment::Start,
+            [(0, 0), (1707, 0), (3627, 0)],
+        ),
+        (
+            PresetKind::Horizontal,
+            BuiltInPosition::Before,
+            Alignment::Center,
+            [(0, 60), (1707, 0), (3627, 180)],
+        ),
+        (
+            PresetKind::Horizontal,
+            BuiltInPosition::After,
+            Alignment::End,
+            [(3200, 120), (0, 0), (1920, 360)],
+        ),
+        (
+            PresetKind::Vertical,
+            BuiltInPosition::Before,
+            Alignment::Start,
+            [(0, 0), (0, 960), (0, 2040)],
+        ),
+        (
+            PresetKind::Vertical,
+            BuiltInPosition::After,
+            Alignment::Center,
+            [(106, 1800), (0, 0), (320, 1080)],
+        ),
+        (
+            PresetKind::Vertical,
+            BuiltInPosition::After,
+            Alignment::End,
+            [(213, 1800), (0, 0), (640, 1080)],
+        ),
+    ] {
+        let settings = PresetSettings {
+            show_in_picker: true,
+            built_in: DisplaySettings {
+                resolution: None,
+                scale: 1.5,
+            },
+            built_in_position: position,
+            alignment,
+            ..PresetSettings::default()
+        };
+        store.save_preset(kind, &settings).unwrap();
+        let reopened = ProfileStore::new(temp.path().into());
+        assert_eq!(reopened.preset_settings(kind).unwrap(), settings);
+        let id = ProfileId::Predefined { preset: kind };
+        assert!(reopened.list_profiles(true).unwrap().contains(&id));
+        let resolved = reopened.resolve(&id, &current).unwrap();
+        for (name, expected) in ["eDP-1", "DP-1", "DP-2"].into_iter().zip(expected) {
+            let row = resolved
+                .outputs
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap();
+            assert!(row.enabled);
+            assert_eq!((row.x, row.y), expected, "{kind:?}: {name}");
+            assert_eq!(row.transform, "normal");
+        }
+        assert!(resolved.mirrors.is_empty());
+        for missing_role in [
+            outputs(&[("eDP-1", true, "Normal")]),
+            outputs(&[("DP-1", true, "Normal")]),
+        ] {
+            assert!(reopened.resolve(&id, &missing_role).is_err());
+        }
+    }
+    assert_eq!(
+        store
+            .preset_settings(PresetKind::Horizontal)
+            .unwrap()
+            .alignment,
+        Alignment::End
+    );
+    assert_eq!(
+        store.preset_settings(PresetKind::MirrorBuiltIn).unwrap(),
+        PresetSettings::default()
+    );
 }
 
 #[test]

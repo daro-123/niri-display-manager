@@ -2,7 +2,7 @@ use crate::backend::NiriClient;
 use crate::daemon::LayoutMemory;
 use crate::mirror::MirrorManager;
 use crate::profile_sync;
-use crate::services::{merge_profile, Profile, ProfileStore};
+use crate::services::{Profile, ProfileId, ProfileStore};
 use anyhow::Result;
 use glib::translate::IntoGlib;
 use gtk::{gdk, glib, prelude::*};
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct State {
-    profiles: Vec<String>,
+    profiles: Vec<ProfileId>,
     busy: bool,
     closing: bool,
     destroyed: bool,
@@ -127,7 +127,7 @@ impl Picker {
         }
     }
 
-    fn build_rows(self: &Rc<Self>, selected: Option<&str>) {
+    fn build_rows(self: &Rc<Self>, selected: Option<&ProfileId>) {
         self.clear_indicator();
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
@@ -153,18 +153,12 @@ impl Picker {
             shortcut.set_width_chars(1);
             shortcut.add_css_class("dim-label");
             content.append(&shortcut);
-            let label = gtk::Label::new(Some(name));
-            label.set_xalign(0.0);
-            label.set_hexpand(true);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            label.set_max_width_chars(32);
-            label.set_tooltip_text(Some(name));
-            content.append(&label);
+            content.append(&crate::profile_widgets::row(name));
             row.set_child(Some(&content));
 
             let source = gtk::DragSource::new();
             source.set_actions(gdk::DragAction::MOVE);
-            let value = name.clone();
+            let value = serde_json::to_string(name).expect("Profile IDs serialize as JSON");
             source.connect_prepare(move |_, _, _| {
                 Some(gdk::ContentProvider::for_value(&value.to_value()))
             });
@@ -203,6 +197,9 @@ impl Picker {
                 else {
                     return false;
                 };
+                let Ok(source) = serde_json::from_str::<ProfileId>(&source) else {
+                    return false;
+                };
                 this.clear_indicator();
                 let state = this.state.borrow();
                 if state.busy || state.previous.is_some() || !state.profiles.contains(&source) {
@@ -211,7 +208,7 @@ impl Picker {
                 if source == target_name {
                     return true;
                 }
-                let mut order: Vec<String> = state
+                let mut order: Vec<ProfileId> = state
                     .profiles
                     .iter()
                     .filter(|name| **name != source)
@@ -239,7 +236,7 @@ impl Picker {
             });
             row.add_controller(target);
             self.list.append(&row);
-            if selected == Some(name.as_str()) || (selected.is_none() && index == 0) {
+            if selected == Some(name) || (selected.is_none() && index == 0) {
                 self.list.select_row(Some(&row));
                 self.focus_selected();
             }
@@ -267,18 +264,18 @@ impl Picker {
         gdk::DragAction::MOVE
     }
 
-    fn apply(self: &Rc<Self>, name: String) {
+    fn apply(self: &Rc<Self>, name: ProfileId) {
         if self.state.borrow().busy || self.state.borrow().previous.is_some() {
             return;
         }
-        self.message(&format!("Applying {name}…"));
+        self.message(&format!("Applying {}…", name.name()));
         self.run(
             move || {
                 let client = NiriClient;
                 let outputs = client.outputs()?;
                 let mut mirrors = MirrorManager::default();
                 let previous = Profile::capture(&client, &mut mirrors)?;
-                let desired = merge_profile(&ProfileStore::default().load(&name)?, &outputs)?;
+                let desired = ProfileStore::default().resolve(&name, &outputs)?;
                 if let Err(error) = desired.apply(&client, &mut mirrors) {
                     return Ok(match previous.apply(&client, &mut mirrors) {
                         Ok(()) => (
@@ -546,7 +543,7 @@ pub fn present(app: &gtk::Application, editor_renderer: Option<OsString>) {
     });
     this.message("Loading profiles…");
     this.run(
-        || ProfileStore::default().list_names(),
+        || ProfileStore::default().list_profiles(true),
         |this, names| {
             let empty = names.is_empty();
             this.state.borrow_mut().profiles = names;

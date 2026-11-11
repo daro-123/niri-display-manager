@@ -2,7 +2,7 @@ use crate::backend::{dimensions, snapshot, Layout, NiriClient, OutputConfig, Out
 use crate::daemon::{self, LayoutMemory};
 use crate::mirror::{MirrorConfig, MirrorManager};
 use crate::profile_sync;
-use crate::services::{merge_profile, ConfigStore, Profile, ProfileStore};
+use crate::services::{ConfigStore, Profile, ProfileId, ProfileMode, ProfileStore};
 use anyhow::{anyhow, bail, Result};
 use gtk::cairo;
 use gtk::gdk;
@@ -56,7 +56,7 @@ struct Editor {
     baseline: Option<Layout>,
     previous: Option<Profile>,
     selected: Option<String>,
-    mirror_pair: Option<MirrorConfig>,
+    mirror_pairs: Vec<MirrorConfig>,
     mirror_source_first: bool,
     busy: bool,
     closing: bool,
@@ -88,6 +88,7 @@ struct Editor {
     mirror_orientation: gtk::CheckButton,
     daemon_toggle: gtk::CheckButton,
     profile_choice: gtk::DropDown,
+    profile_entries: Vec<ProfileId>,
     profile_name: gtk::Entry,
     profile_status: gtk::Label,
     profile_apply: gtk::Button,
@@ -194,6 +195,7 @@ impl Editor {
         profile_box.set_margin_end(16);
         profile_box.append(&heading("Saved profiles"));
         let profile_choice = dropdown(&[]);
+        crate::profile_widgets::configure_dropdown(&profile_choice);
         profile_box.append(&profile_choice);
         let profile_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let profile_apply = gtk::Button::with_label("Apply profile");
@@ -208,7 +210,7 @@ impl Editor {
         let save_profile = gtk::Button::with_label("Save current edits");
         profile_box.append(&save_profile);
         profile_box.append(&dim_label(
-            "Saves display settings, including unapplied edits, and the active mirror.",
+            "Saves display settings, including unapplied edits and active mirrors. Configure predefined profiles in Settings.",
         ));
         let profile_status = gtk::Label::new(None);
         profile_status.set_xalign(0.0);
@@ -246,6 +248,8 @@ impl Editor {
         daemon_toggle.set_tooltip_text(Some("Run a background user service, including after closing this window. Remember layouts on disconnect and restore them at login and reconnect. Requires a systemd user session."));
         daemon_toggle.set_sensitive(false);
         settings_box.append(&daemon_toggle);
+        let preset_settings = gtk::Button::with_label("Predefined profiles…");
+        settings_box.append(&preset_settings);
         settings_popover.set_child(Some(&settings_box));
         settings.set_popover(Some(&settings_popover));
         toolbar.append(&settings);
@@ -395,7 +399,7 @@ impl Editor {
             baseline: None,
             previous: None,
             selected: None,
-            mirror_pair: None,
+            mirror_pairs: Vec::new(),
             mirror_source_first: true,
             busy: false,
             closing: false,
@@ -427,6 +431,7 @@ impl Editor {
             mirror_orientation,
             daemon_toggle,
             profile_choice,
+            profile_entries: Vec::new(),
             profile_name,
             profile_status,
             profile_apply,
@@ -452,6 +457,32 @@ impl Editor {
             import_button,
             export_button,
         );
+        let w = weak(&editor);
+        preset_settings.connect_clicked(move |_| {
+            if let Some(editor) = w.upgrade() {
+                let state = editor.borrow();
+                if state.busy || state.previous.is_some() {
+                    return;
+                }
+                settings_popover.popdown();
+                crate::preset_settings::present(
+                    &state.window,
+                    state.profiles.clone(),
+                    &state.outputs,
+                );
+            }
+        });
+        let w = weak(&editor);
+        editor
+            .borrow()
+            .profile_choice
+            .connect_selected_notify(move |_| {
+                if let Some(editor) = w.upgrade() {
+                    if let Ok(state) = editor.try_borrow() {
+                        state.update_profile_delete();
+                    }
+                }
+            });
         editor
     }
 
@@ -1401,17 +1432,17 @@ impl Editor {
         self.update_mirror_actions();
     }
     fn sync_mirror_state(&mut self) {
-        match self.mirrors.current() {
-            Ok(mirror) => self.mirror_pair = mirror,
+        match self.mirrors.current_all() {
+            Ok(mirrors) => self.mirror_pairs = mirrors,
             Err(error) => {
-                self.mirror_pair = None;
+                self.mirror_pairs.clear();
                 self.message(&format!("Cannot read active mirror: {error:#}"));
             }
         }
         self.update_mirror_actions();
     }
     fn update_mirror_actions(&mut self) {
-        let running = self.mirror_pair.is_some();
+        let running = !self.mirror_pairs.is_empty();
         let selected = self
             .layout
             .iter()
@@ -1456,11 +1487,14 @@ impl Editor {
         }
         self.mirror_menu.set_visible(!running);
         let multiple = self.outputs.len() > 1;
-        let status = if let Some(pair) = &self.mirror_pair {
-            format!(
-                "Active · {} → {}. Stop this mirror before starting another.",
-                pair.source, pair.target
-            )
+        let status = if running {
+            let pairs = self
+                .mirror_pairs
+                .iter()
+                .map(|pair| format!("{} → {}", pair.source, pair.target))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Active · {pairs}. Stop mirroring before starting another.")
         } else if !multiple {
             "Mirroring requires at least two connected displays.".into()
         } else if !active {
@@ -1746,9 +1780,9 @@ impl Editor {
     }
 
     fn apply(e: &Rc<RefCell<Self>>) {
-        let active_mirror = e.borrow_mut().mirrors.current();
-        let pair = match active_mirror {
-            Ok(pair) => pair,
+        let active_mirrors = e.borrow_mut().mirrors.current_all();
+        let pairs = match active_mirrors {
+            Ok(pairs) => pairs,
             Err(error) => {
                 e.borrow()
                     .message(&format!("Cannot read active mirror: {error:#}"));
@@ -1757,7 +1791,7 @@ impl Editor {
         };
         let desired = {
             let mut s = e.borrow_mut();
-            s.mirror_pair = pair.clone();
+            s.mirror_pairs = pairs.clone();
             s.layout.clone()
         };
         if !desired.iter().any(|item| item.enabled) {
@@ -1765,7 +1799,7 @@ impl Editor {
                 .message("At least one display must remain enabled.");
             return;
         }
-        if pair.as_ref().is_some_and(|p| {
+        if pairs.iter().any(|p| {
             desired
                 .iter()
                 .any(|item| !item.enabled && (item.name == p.source || item.name == p.target))
@@ -1779,7 +1813,8 @@ impl Editor {
             e,
             Profile {
                 outputs: desired,
-                mirror: pair,
+                mirrors: pairs,
+                mode: ProfileMode::Exact,
             },
             true,
             "Layout applied. Awaiting confirmation.",
@@ -1857,7 +1892,7 @@ impl Editor {
         Self::apply_profile_transaction(e, previous, false, "Previous settings restored.");
     }
 
-    fn reload_profiles(e: &Rc<RefCell<Self>>, selected: Option<String>) {
+    fn reload_profiles(e: &Rc<RefCell<Self>>, selected: Option<ProfileId>) {
         {
             let s = e.borrow();
             if s.busy {
@@ -1871,33 +1906,39 @@ impl Editor {
         Self::run_with_ui_lock(
             e,
             false,
-            move || store.list_names(),
-            move |e, names| {
-                let s = e.borrow();
+            move || store.list_profiles(false),
+            move |e, entries| {
+                let mut s = e.borrow_mut();
                 let old = selected.or_else(|| {
-                    s.profile_choice
-                        .selected_item()
-                        .and_downcast::<gtk::StringObject>()
-                        .map(|v| v.string().to_string())
+                    s.profile_entries
+                        .get(s.profile_choice.selected() as usize)
+                        .cloned()
                 });
-                s.profile_choice.set_model(Some(&gtk::StringList::new(
-                    &names.iter().map(String::as_str).collect::<Vec<_>>(),
-                )));
+                s.profile_choice
+                    .set_model(Some(&crate::profile_widgets::model(&entries)));
+                s.profile_entries = entries.clone();
                 if let Some(index) =
-                    old.and_then(|name| names.iter().position(|candidate| candidate == &name))
+                    old.and_then(|name| entries.iter().position(|candidate| candidate == &name))
                 {
                     s.profile_choice.set_selected(index as u32);
                 }
-                s.profile_choice.set_sensitive(!names.is_empty());
-                s.profile_apply.set_sensitive(!names.is_empty());
-                s.profile_delete.set_sensitive(!names.is_empty());
-                s.profile_status.set_text(if names.is_empty() {
+                s.profile_choice.set_sensitive(!entries.is_empty());
+                s.profile_apply.set_sensitive(!entries.is_empty());
+                s.update_profile_delete();
+                s.profile_status.set_text(if entries.is_empty() {
                     "No saved profiles yet."
                 } else {
                     ""
                 });
             },
         );
+    }
+    fn update_profile_delete(&self) {
+        self.profile_delete.set_sensitive(matches!(
+            self.profile_entries
+                .get(self.profile_choice.selected() as usize),
+            Some(ProfileId::Named(_))
+        ));
     }
     fn save_profile(e: &Rc<RefCell<Self>>) {
         let (name, layout, store, mut mirrors) = {
@@ -1919,7 +1960,8 @@ impl Editor {
                 let result = (|| {
                     let profile = Profile {
                         outputs: layout,
-                        mirror: mirrors.current()?,
+                        mirrors: mirrors.current_all()?,
+                        mode: ProfileMode::Exact,
                     };
                     profile
                         .validate()
@@ -1935,7 +1977,7 @@ impl Editor {
                 match result {
                     Ok(name) => {
                         e.borrow().profile_name.set_text("");
-                        Self::reload_profiles(e, Some(name.clone()));
+                        Self::reload_profiles(e, Some(ProfileId::Named(name.clone())));
                         e.borrow()
                             .profile_status
                             .set_text(&format!("Saved profile “{name}”."));
@@ -1956,9 +1998,11 @@ impl Editor {
             if s.busy || s.previous.is_some() {
                 return;
             }
-            selected_string(&s.profile_choice)
+            s.profile_entries
+                .get(s.profile_choice.selected() as usize)
+                .cloned()
         };
-        let Ok(name) = name else {
+        let Some(name) = name else {
             e.borrow().profile_status.set_text("Select an item first.");
             return;
         };
@@ -1966,13 +2010,13 @@ impl Editor {
             let s = e.borrow();
             (s.profiles.clone(), s.client.clone())
         };
-        e.borrow().message(&format!("Loading profile “{name}”…"));
+        e.borrow()
+            .message(&format!("Loading profile “{}”…", name.name()));
         Self::run(
             e,
             move || {
-                let profile = store.load(&name)?;
                 let outputs = client.outputs()?;
-                let profile = merge_profile(&profile, &outputs)?;
+                let profile = store.resolve(&name, &outputs)?;
                 profile
                     .validate()
                     .map_err(|error| anyhow!("Invalid profile: {error:#}"))?;
@@ -1999,10 +2043,14 @@ impl Editor {
             if s.busy || s.previous.is_some() {
                 return;
             }
-            selected_string(&s.profile_choice)
+            s.profile_entries
+                .get(s.profile_choice.selected() as usize)
+                .cloned()
         };
-        let Ok(name) = name else {
-            e.borrow().profile_status.set_text("Select an item first.");
+        let Some(ProfileId::Named(name)) = name else {
+            e.borrow()
+                .profile_status
+                .set_text("Predefined profiles are edited in Settings and cannot be deleted.");
             return;
         };
         let dialog = gtk::AlertDialog::builder()
@@ -2289,10 +2337,10 @@ impl Editor {
             return glib::ControlFlow::Continue;
         }
         let error = s.mirrors.poll_error();
-        let before = s.mirror_pair.clone();
+        let before = s.mirror_pairs.clone();
         s.sync_mirror_state();
-        if before != s.mirror_pair && error.is_none() {
-            s.message(if s.mirror_pair.is_some() {
+        if before != s.mirror_pairs && error.is_none() {
+            s.message(if !s.mirror_pairs.is_empty() {
                 "Mirror started in another window."
             } else {
                 "Mirror ended."
@@ -2482,11 +2530,4 @@ fn same_layout(a: &Layout, b: &Layout) -> bool {
         .map(|x| (&x.name, x))
         .collect::<std::collections::BTreeMap<_, _>>();
     left == right
-}
-fn selected_string(dropdown: &gtk::DropDown) -> Result<String> {
-    dropdown
-        .selected_item()
-        .and_downcast::<gtk::StringObject>()
-        .map(|i| i.string().to_string())
-        .ok_or_else(|| anyhow!("Select an item first."))
 }

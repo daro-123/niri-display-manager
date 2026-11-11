@@ -26,12 +26,63 @@ pub struct MirrorConfig {
     pub target: String,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Session {
+    pid: Option<u32>,
+    start_time: Option<u64>,
+    config: Option<MirrorConfig>,
+}
+
+#[derive(Serialize, Default)]
 struct State {
+    sessions: Vec<Session>,
+    pending_errors: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct LegacyState {
     pid: Option<u32>,
     start_time: Option<u64>,
     config: Option<MirrorConfig>,
     pending_error: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for State {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Multiple {
+                sessions: Vec<Session>,
+                #[serde(default)]
+                pending_errors: Vec<String>,
+            },
+            Single(LegacyState),
+        }
+        Ok(match Stored::deserialize(deserializer)? {
+            Stored::Multiple {
+                sessions,
+                pending_errors,
+            } => Self {
+                sessions,
+                pending_errors,
+            },
+            Stored::Single(old) => {
+                let mut state = Self::default();
+                if old.pid.is_some() || old.start_time.is_some() || old.config.is_some() {
+                    state.sessions.push(Session {
+                        pid: old.pid,
+                        start_time: old.start_time,
+                        config: old.config,
+                    });
+                }
+                state.pending_errors.extend(old.pending_error);
+                state
+            }
+        })
+    }
 }
 
 pub struct MirrorManager {
@@ -116,24 +167,58 @@ impl MirrorManager {
     }
 
     pub fn start(&mut self, source: &str, target: &str) -> Result<()> {
-        if source.trim().is_empty() {
-            bail!("Mirror source output must not be empty.");
+        self.start_all(&[MirrorConfig {
+            source: source.to_owned(),
+            target: target.to_owned(),
+        }])
+    }
+
+    pub fn start_all(&mut self, configs: &[MirrorConfig]) -> Result<()> {
+        if configs.is_empty() {
+            bail!("At least one mirror target is required.");
         }
-        if target.trim().is_empty() {
-            bail!("Mirror target output must not be empty.");
-        }
-        if source == target {
-            bail!("Mirror source and target outputs must be different.");
+        for config in configs {
+            if config.source.trim().is_empty() {
+                bail!("Mirror source output must not be empty.");
+            }
+            if config.target.trim().is_empty() {
+                bail!("Mirror target output must not be empty.");
+            }
+            if config.source == config.target {
+                bail!("Mirror source and target outputs must be different.");
+            }
         }
         let (_lock, path) = self.open()?;
         let mut state = Self::read_state(&path)?;
         Self::stop_state(&self.directory, &mut state)?;
-        state.pending_error = None;
+        state.pending_errors.clear();
         Self::write_state(&path, &state)?;
+        let result = (|| -> Result<()> {
+            for config in configs {
+                let session = Self::start_session(&self.directory, config)?;
+                state.sessions.push(session);
+                Self::write_state(&path, &state)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let cleanup = Self::stop_state(&self.directory, &mut state);
+            let _ = Self::write_state(&path, &state);
+            return match cleanup {
+                Ok(()) => Err(error).context("Cannot start all mirror targets"),
+                Err(cleanup_error) => Err(error).context(format!(
+                    "Cannot start all mirror targets; cleanup failed: {cleanup_error:#}"
+                )),
+            };
+        }
+        Ok(())
+    }
+
+    fn start_session(directory: &Path, config: &MirrorConfig) -> Result<Session> {
         let binary = which("wl-mirror").ok_or_else(|| anyhow!("Cannot start mirroring: 'wl-mirror' was not found. Install wl-mirror and ensure it is on PATH."))?;
         let nix = which("nixGL")
             .filter(|_| fs::canonicalize(&binary).is_ok_and(|p| p.starts_with("/nix/store")));
-        let log_path = self.directory.join("stderr.log");
+        let log_path = Self::log_path(directory, config);
         let stderr = OpenOptions::new()
             .create(true)
             .write(true)
@@ -145,7 +230,7 @@ impl MirrorManager {
         if nix.is_some() {
             command.arg(&binary);
         }
-        command.args(["--fullscreen-output", target, source]);
+        command.args(["--fullscreen-output", &config.target, &config.source]);
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -162,9 +247,8 @@ impl MirrorManager {
             .spawn()
             .context("Cannot start wl-mirror")?;
         let pid = child.id();
-        let identity =
-            proc_identity(pid).filter(|identity| identity.group == pid && identity.session == pid);
-        let started = (|| -> Result<()> {
+        let identity = proc_identity(pid).filter(|i| i.group == pid && i.session == pid);
+        let started = (|| -> Result<Session> {
             let identity =
                 identity.ok_or_else(|| anyhow!("Cannot identify managed wl-mirror process."))?;
             let until = Instant::now() + STARTUP_WAIT;
@@ -172,11 +256,11 @@ impl MirrorManager {
                 if let Some(status) = child.try_wait()? {
                     bail!("wl-mirror exited during startup ({status}).");
                 }
-                if !proc_identity(pid).is_some_and(|current| {
-                    current.start_time == identity.start_time
-                        && current.group == pid
-                        && current.session == pid
-                        && current.alive
+                if !proc_identity(pid).is_some_and(|i| {
+                    i.start_time == identity.start_time
+                        && i.group == pid
+                        && i.session == pid
+                        && i.alive
                 }) {
                     bail!("wl-mirror exited during startup.");
                 }
@@ -185,128 +269,99 @@ impl MirrorManager {
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            state.pid = Some(pid);
-            state.start_time = Some(identity.start_time);
-            state.config = Some(MirrorConfig {
-                source: source.to_owned(),
-                target: target.to_owned(),
-            });
-            Self::write_state(&path, &state)
+            Ok(Session {
+                pid: Some(pid),
+                start_time: Some(identity.start_time),
+                config: Some(config.clone()),
+            })
         })();
-        if let Err(error) = started {
-            if identity.is_some_and(|identity| {
-                proc_identity(pid).is_some_and(|current| {
-                    current.start_time == identity.start_time
-                        && current.group == pid
-                        && current.session == pid
-                })
-            }) {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
+        match started {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                if identity.is_some_and(|i| {
+                    proc_identity(pid).is_some_and(|c| {
+                        c.start_time == i.start_time && c.group == pid && c.session == pid
+                    })
+                }) {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
                 }
+                let _ = child.kill();
+                let _ = child.wait();
+                let detail = Self::stderr_detail(&log_path);
+                Err(error).context(if detail.is_empty() {
+                    "Cannot start mirroring".to_owned()
+                } else {
+                    format!("Cannot start mirroring:\n{detail}")
+                })
             }
-            let _ = child.kill();
-            let _ = child.wait();
-            let detail = Self::stderr_detail(&log_path);
-            return Err(error).context(if detail.is_empty() {
-                "Cannot start mirroring".to_owned()
-            } else {
-                format!("Cannot start mirroring:\n{detail}")
-            });
         }
-        Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {
         let (_lock, path) = self.open()?;
         let mut state = Self::read_state(&path)?;
         Self::stop_state(&self.directory, &mut state)?;
-        state.pending_error = None;
+        state.pending_errors.clear();
         Self::write_state(&path, &state)
     }
 
     fn stop_state(directory: &Path, state: &mut State) -> Result<()> {
-        if let (Some(pid), Some(start)) = (state.pid, state.start_time) {
-            if proc_identity(pid)
-                .is_some_and(|i| i.start_time == start && i.group == pid && i.session == pid)
-            {
-                let group = -(pid as i32);
-                if unsafe { libc::kill(group, libc::SIGTERM) } != 0
-                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        let mut first_error = None;
+        for session in &mut state.sessions {
+            if let (Some(pid), Some(start)) = (session.pid, session.start_time) {
+                if proc_identity(pid)
+                    .is_some_and(|i| i.start_time == start && i.group == pid && i.session == pid)
                 {
-                    return Err(std::io::Error::last_os_error())
-                        .context("Cannot stop managed wl-mirror process group");
-                }
-                let until = Instant::now() + STOP_WAIT;
-                while Instant::now() < until {
-                    if !group_exists(pid) {
-                        break;
+                    let group = -(pid as i32);
+                    if unsafe { libc::kill(group, libc::SIGTERM) } != 0
+                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                    {
+                        first_error.get_or_insert_with(|| {
+                            anyhow!(std::io::Error::last_os_error())
+                                .context("Cannot stop managed wl-mirror process group")
+                        });
+                        continue;
                     }
-                    thread::sleep(Duration::from_millis(20));
-                }
-                if group_exists(pid) {
-                    if proc_identity(pid).is_some_and(|i| {
-                        i.start_time == start && i.group == pid && i.session == pid
-                    }) {
-                        if unsafe { libc::kill(group, libc::SIGKILL) } != 0
-                            && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-                        {
-                            return Err(std::io::Error::last_os_error())
-                                .context("Cannot kill managed wl-mirror process group");
+                    let until = Instant::now() + STOP_WAIT;
+                    while Instant::now() < until && group_exists(pid) {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    if group_exists(pid) {
+                        if proc_identity(pid).is_some_and(|i| {
+                            i.start_time == start && i.group == pid && i.session == pid
+                        }) {
+                            if unsafe { libc::kill(group, libc::SIGKILL) } != 0
+                                && std::io::Error::last_os_error().raw_os_error()
+                                    != Some(libc::ESRCH)
+                            {
+                                first_error.get_or_insert_with(|| {
+                                    anyhow!(std::io::Error::last_os_error())
+                                        .context("Cannot kill managed wl-mirror process group")
+                                });
+                                continue;
+                            }
+                        } else {
+                            first_error.get_or_insert_with(|| anyhow!("Managed wl-mirror process identity changed; refusing to signal process group."));
+                            continue;
                         }
-                    } else {
-                        bail!("Managed wl-mirror process identity changed; refusing to signal process group.");
                     }
-                }
-                let until = Instant::now() + STOP_WAIT;
-                loop {
-                    if !group_exists(pid) {
-                        break;
+                    let until = Instant::now() + STOP_WAIT;
+                    while group_exists(pid) && Instant::now() < until {
+                        thread::sleep(Duration::from_millis(20));
                     }
-                    if Instant::now() >= until {
-                        bail!("Managed wl-mirror process group did not stop.");
+                    if group_exists(pid) {
+                        first_error.get_or_insert_with(|| {
+                            anyhow!("Managed wl-mirror process group did not stop.")
+                        });
+                        continue;
                     }
-                    thread::sleep(Duration::from_millis(20));
-                }
-                reap_child(pid);
-            } else if state.config.is_some() {
-                let detail = Self::stderr_detail(&directory.join("stderr.log"));
-                state.pending_error = Some(format!(
-                    "wl-mirror exited unexpectedly.{}",
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n{detail}")
-                    }
-                ));
-            }
-        }
-        state.pid = None;
-        state.start_time = None;
-        state.config = None;
-        Ok(())
-    }
-
-    pub fn current(&mut self) -> Result<Option<MirrorConfig>> {
-        let (_lock, path) = self.open()?;
-        let mut state = Self::read_state(&path)?;
-        if let (Some(pid), Some(start)) = (state.pid, state.start_time) {
-            match proc_identity(pid) {
-                Some(identity)
-                    if identity.start_time == start
-                        && identity.group == pid
-                        && identity.session == pid
-                        && identity.alive =>
-                {
-                    return Ok(state.config);
-                }
-                _ => {
                     reap_child(pid);
-                    let detail = Self::stderr_detail(&self.directory.join("stderr.log"));
-                    state.pid = None;
-                    state.start_time = None;
-                    state.config = None;
-                    state.pending_error = Some(format!(
+                } else if session.config.is_some() {
+                    let log_path = Self::log_path(directory, session.config.as_ref().unwrap());
+                    let detail = Self::stderr_detail(&log_path);
+                    state.pending_errors.push(format!(
                         "wl-mirror exited unexpectedly.{}",
                         if detail.is_empty() {
                             String::new()
@@ -314,22 +369,79 @@ impl MirrorManager {
                             format!("\n{detail}")
                         }
                     ));
-                    Self::write_state(&path, &state)?;
                 }
             }
+            session.pid = None;
+            session.start_time = None;
+            session.config = None;
         }
-        Ok(None)
+        state
+            .sessions
+            .retain(|s| s.pid.is_some() || s.config.is_some());
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
-    pub fn running(&mut self) -> bool {
-        self.current().ok().flatten().is_some()
+    fn log_path(directory: &Path, config: &MirrorConfig) -> PathBuf {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        config.target.hash(&mut hasher);
+        directory.join(format!("stderr-{:016x}.log", hasher.finish()))
+    }
+
+    pub fn current_all(&mut self) -> Result<Vec<MirrorConfig>> {
+        let (_lock, path) = self.open()?;
+        let mut state = Self::read_state(&path)?;
+        let mut active = Vec::new();
+        let mut changed = false;
+        for session in &mut state.sessions {
+            if let (Some(pid), Some(start)) = (session.pid, session.start_time) {
+                if proc_identity(pid).is_some_and(|i| {
+                    i.start_time == start && i.group == pid && i.session == pid && i.alive
+                }) {
+                    if let Some(config) = session.config.clone() {
+                        active.push(config);
+                    }
+                    continue;
+                }
+                reap_child(pid);
+                let detail = session
+                    .config
+                    .as_ref()
+                    .map(|c| Self::stderr_detail(&Self::log_path(&self.directory, c)))
+                    .unwrap_or_default();
+                state.pending_errors.push(format!(
+                    "wl-mirror exited unexpectedly.{}",
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{detail}")
+                    }
+                ));
+                session.pid = None;
+                session.start_time = None;
+                session.config = None;
+                changed = true;
+            }
+        }
+        state.sessions.retain(|s| s.pid.is_some());
+        if changed {
+            Self::write_state(&path, &state)?;
+        }
+        Ok(active)
     }
 
     pub fn poll_error(&mut self) -> Option<String> {
-        let _ = self.current();
+        let _ = self.current_all();
         let (_lock, path) = self.open().ok()?;
         let mut state = Self::read_state(&path).ok()?;
-        let error = state.pending_error.take()?;
+        if state.pending_errors.is_empty() {
+            return None;
+        }
+        let error = state.pending_errors.remove(0);
         let _ = Self::write_state(&path, &state);
         Some(error)
     }
